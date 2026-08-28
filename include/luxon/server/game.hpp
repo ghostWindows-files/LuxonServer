@@ -13,7 +13,9 @@
 #endif
 
 #include <memory>
+#include <atomic>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include <list>
 #include <variant>
@@ -131,22 +133,14 @@ struct Game : std::enable_shared_from_this<Game> {
     std::vector<std::string> lobby_props;
     std::list<Event> event_cache;
     
-    // Concurrent join control: prevent race conditions when multiple players join simultaneously
-    bool is_creating = false;
-    
-    // Pending join queue: store players attempting to join while room is initializing
-    struct PendingJoinRequest {
-        std::weak_ptr<Peer> peer;
-        std::string game_id;
-        std::string user_id;
-        ser::HashtablePtr game_props;
-        ser::HashtablePtr actor_props;
-        // Constructor
-        PendingJoinRequest(std::weak_ptr<Peer> p, std::string g, std::string u)
-            : peer(p), game_id(g), user_id(u) {}
-    };
-    std::list<PendingJoinRequest> pending_join;  // Queue of join requests waiting for room initialization
-    
+    // True while the first join request is initializing the room. Pending requests
+    // remain on their own handlers so they can resume with the original context.
+    std::atomic_bool is_creating = false;
+
+    bool try_begin_creation();
+    void finish_creation() { is_creating.store(false, std::memory_order_release); }
+
+
     // Player state tracking for reconnection support (Phase 4)
     struct InactivePlayerInfo {
         int32_t actor_id;

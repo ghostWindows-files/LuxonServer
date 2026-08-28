@@ -61,7 +61,7 @@ Awaitable<ser::OperationResponseMessage> authenticate(ServerManager& server_mana
     ZoneScoped;
 
     // Stop if maximum connection count is reached
-    if (server_manager.get_max_connections() != 0 && server_manager.get_connection_count() > server_manager.get_max_connections()) {
+    if (server_manager.get_max_connections() != 0 && server_manager.get_connection_count() >= server_manager.get_max_connections()) {
         lco_return{.operation_code = req.operation_code,
                    .return_code = ErrorCodes::Throttling::MaxCcuReached,
                    .debug_message = std::format("Max CCU of {} reached", server_manager.get_max_connections())};

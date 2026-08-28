@@ -105,7 +105,7 @@ std::expected<std::shared_ptr<Game>, ser::OperationResponseMessage> Lobby::creat
     }
 
     const auto max_game_count = app->get_settings().max_game_count;
-    if (max_game_count && app->get_game_count() > max_game_count) {
+    if (max_game_count && app->get_game_count() >= max_game_count) {
         return std::unexpected(ser::OperationResponseMessage{
             .operation_code = OpCodes::Matchmaking::CreateGame, .return_code = ErrorCodes::Server::ServerFull, .debug_message = "Game count limit reached!"});
     }

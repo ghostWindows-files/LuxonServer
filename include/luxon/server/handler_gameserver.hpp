@@ -8,6 +8,8 @@
 #include "peer_persistence.hpp"
 #include "coro_support.hpp"
 
+#include <optional>
+#include <commoncpp/timer.hpp>
 #include <luxon/ser_types.hpp>
 
 namespace server {
@@ -30,5 +32,15 @@ protected:
     std::shared_ptr<Game> current_game_;
     GamePeer *game_peer_{};
     bool has_left_{};
+
+    struct PendingJoin {
+        ser::OperationRequestMessage request;
+        bool is_encrypted{};
+        enet::EnetCommandHeader command_header;
+        common::Timer wait_started;
+    };
+    std::optional<PendingJoin> pending_join_;
+
+    void HandleSlowUpdate() override;
 };
 } // namespace server

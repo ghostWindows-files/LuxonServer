@@ -89,6 +89,14 @@ Game::~Game() {
 Game::Game(std::shared_ptr<Lobby> lobby, std::string id, std::string_view server_address)
     : lobby(std::move(lobby)), id(std::move(id)), server_address(get_server_manager().get_static_endpoint_address_str(server_address)) {}
 
+bool Game::try_begin_creation() {
+    if (is_created || !peers.empty())
+        return false;
+
+    bool expected = false;
+    return is_creating.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 void Game::add_game_info(ser::ParameterList& params) const {
     params[DictKeyCodes::GameAndActor::GameId] = id;
     params[DictKeyCodes::LoadBalancing::Address] = std::string(server_address);
@@ -118,12 +126,10 @@ bool Game::matches_game_info(const GameInfo& info) const {
 GamePeer Game::create_peer(std::shared_ptr<Peer> peer) {
     ZoneScoped;
 
-    GamePeer fres{.peer = std::move(peer)};
+    if (!peer || !peer->persistent)
+        return {};
 
-    if (!peer)
-        return {};
-    if (!peer->persistent)
-        return {};
+    GamePeer fres{.peer = peer};
 
     // Find free actor number
     int start_id = last_actor_id;
@@ -167,7 +173,7 @@ GamePeer *Game::add_peer(GamePeer&& game_peer) {
                     return nullptr;
 
     // Add peer to list
-    auto& fres = peers.emplace_back(game_peer);
+    auto& fres = peers.emplace_back(std::move(game_peer));
 
     // Remove user from expected users
     expected_users.erase(peer->persistent->user_id);
@@ -251,8 +257,8 @@ bool Game::flood_peer(GamePeer *game_peer) {
                                  .sender_actor_id = 0,  // System event
                                  .delivery_mode = enet::EnetDeliveryMode::Reliable,
                                  .receivers = std::unordered_set<int32_t>{game_peer->actor_id}};
-                props_event.top_params[DictKeyCodes::GameAndActor::ActorNo] = static_cast<int32_t>(0);
-                props_event.top_params[DictKeyCodes::RoutingAndEvents::Data] = std::make_shared<ser::Hashtable>(current_game_props);
+                props_event.top_params[DictKeyCodes::GameAndActor::TargetActorNo] = static_cast<int32_t>(0);
+                props_event.top_params[DictKeyCodes::Properties::Properties] = std::move(current_game_props);
 
                 const auto expected_props_payload = props_event.get_cached_data(*peer->protocol);
                 if (!expected_props_payload)
@@ -269,8 +275,8 @@ bool Game::flood_peer(GamePeer *game_peer) {
                                  .sender_actor_id = 0,  // System event
                                  .delivery_mode = enet::EnetDeliveryMode::Reliable,
                                  .receivers = std::unordered_set<int32_t>{game_peer->actor_id}};
-                props_event.top_params[DictKeyCodes::GameAndActor::ActorNo] = static_cast<int32_t>(1);  // Non-zero means actor properties
-                props_event.top_params[DictKeyCodes::RoutingAndEvents::Data] = std::make_shared<ser::Hashtable>(current_actor_props);
+                props_event.top_params[DictKeyCodes::GameAndActor::TargetActorNo] = static_cast<int32_t>(0);
+                props_event.top_params[DictKeyCodes::Properties::Properties] = std::move(current_actor_props);
 
                 const auto expected_props_payload = props_event.get_cached_data(*peer->protocol);
                 if (!expected_props_payload)
@@ -387,33 +393,23 @@ std::pair<int16_t, std::string_view> Game::validate_join(const std::string& user
     if (!is_open)
         return {ErrorCodes::Matchmaking::GameClosed, "Game is closed"};
 
-    // Check capacity (peers + expected users)
-    if (max_peers > 0) {
-        const size_t current_count = peers.size() + dummy_peer_count;
-        const size_t reserved_count = expected_users.size();
+    // Check capacity (peers + expected users). The application-wide cap must
+    // still apply when the room itself has no MaxPlayers limit.
+    const size_t current_count = peers.size() + dummy_peer_count;
+    const size_t reserved_count = expected_users.size();
+    const bool joining_user_is_reserved = expected_users.contains(user_id);
+    const size_t needed_slots = (joining_user_is_reserved ? 0 : 1) + new_expected_users_count;
+    const size_t final_peer_count = current_count + reserved_count + needed_slots;
 
-        // Expected users don't consume at slot
-        const bool joining_user_is_reserved = expected_users.contains(user_id);
+    if (max_peers > 0 && final_peer_count > max_peers)
+        return {ErrorCodes::Matchmaking::GameFull, "Game is full"};
 
-        // Calculate total needed slots
-        size_t needed_slots = (joining_user_is_reserved ? 0 : 1) + new_expected_users_count;
-
-        // Calculate amount peers that have to be allowed
-        const auto final_peer_count = current_count + reserved_count + needed_slots;
-
-        // Return error if game is full
-        if (final_peer_count > max_peers)
+    if (const auto max_game_peers = lobby->app->get_settings().max_peers_per_game)
+        if (final_peer_count > max_game_peers)
             return {ErrorCodes::Matchmaking::GameFull, "Game is full"};
 
-        // Return error if limit of peers per game is reached
-        if (const auto max_game_peers = lobby->app->get_settings().max_peers_per_game)
-            if (final_peer_count > max_game_peers)
-                return {ErrorCodes::Matchmaking::GameFull, "Game is full"};
-
-        // Return error if actor list is full
-        if (current_count + needed_slots > 0xfe)
-            return {ErrorCodes::Matchmaking::ActorListFull, "Game is full"};
-    }
+    if (current_count + needed_slots > 0xfe)
+        return {ErrorCodes::Matchmaking::ActorListFull, "Game is full"};
 
     // Check user id uniqueness if enabled
     if (flags & GameFlags::CheckUserOnJoin)
@@ -609,7 +605,11 @@ bool Game::insert_actor_props(int32_t actor_id, const ser::Hashtable& update) {
 bool Game::expect_actor_props(int32_t actor_id, const ser::Hashtable& expected) {
     ZoneScoped;
 
-    const auto& actor_props = find_peer(actor_id)->actor_props;
+    const auto *game_peer = find_peer(actor_id);
+    if (!game_peer)
+        return false;
+
+    const auto& actor_props = game_peer->actor_props;
     for (const auto& [key, value] : expected)
         if ((!actor_props.contains(key) && (!value.is_null() || !(flags & GameFlags::DeleteNullProps))) || actor_props.at(key) != value)
             return false;
@@ -621,8 +621,7 @@ Event Game::create_property_update_event(int32_t actor_id, ser::Hashtable props,
     Event event{.code = EventCodes::PropertiesUpdate,
                 .sender_actor_id = actor_id,
                 .receivers = (flags & GameFlags::BroadcastPropsChangeToAll) ? ReceiverGroup::All : ReceiverGroup::Others};
-    if (target_actor_id)
-        event.top_params[DictKeyCodes::GameAndActor::TargetActorNo] = target_actor_id;
+    event.top_params[DictKeyCodes::GameAndActor::TargetActorNo] = target_actor_id;
     event.top_params[DictKeyCodes::Properties::Properties] = std::move(props);
     return event;
 }
