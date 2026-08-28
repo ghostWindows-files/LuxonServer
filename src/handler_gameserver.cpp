@@ -44,6 +44,10 @@ using SetProperties =
 using ChangeInterestGroups = Model<Parameter<ser::ByteArray, RoutingAndEvents::Add, true>, Parameter<ser::ByteArray, RoutingAndEvents::Remove, true>>;
 } // namespace models
 
+// Forward declaration for pending join processing
+Awaitable<> ProcessPendingJoins(GameServerHandler* handler, std::shared_ptr<Game>& game, ser::IProtocol* proto);
+
+
 Awaitable<> GameServerHandler::HandleDisconnect() {
     ZoneScoped;
 
@@ -356,18 +360,8 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             auto reset_creating = [&]() {
                 if (is_master && game->is_creating) {
                     game->is_creating = false;
-                    peer_->log->info("Room initialization complete, is_creating=false, processing pending joins");
-                    
-                    // Process pending join requests from queue
-                    while (!game->pending_join.empty()) {
-                        auto& pending = game->pending_join.front();
-                        if (auto pending_peer = pending.peer.lock()) {
-                            peer_->log->debug("Processing pending join from queue for user: {}", pending.user_id);
-                            // TODO: Invoke join handler for pending peer
-                            // This would require extracting join logic into a separate function
-                        }
-                        game->pending_join.pop_front();
-                    }
+                    peer_->log->info("Room initialization complete, is_creating=false, processing {} pending joins", 
+                                     game->pending_join.size());
                 }
             };
 
@@ -537,6 +531,15 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
 
             // Flood the client with current state
             game->flood_peer(game_peer_);
+
+            // CRITICAL FIX: Process pending joins immediately after master initialization complete
+            // This ensures all waiting players are added to the game with complete room state
+            if (is_master && !game->pending_join.empty()) {
+                peer_->log->info("Master player initialization complete. Processing {} pending joins", 
+                                 game->pending_join.size());
+                lco_await ProcessPendingJoins(this, game, proto_);
+                peer_->log->info("All pending joins processed");
+            }
 
             lco_return;
         }
@@ -727,4 +730,89 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
 
     lco_return lco_await HandlerBase::HandleOperationRequest(std::move(req), is_encrypted, cmd_header);
 }
+
+// CRITICAL FIX: Implementation of pending join request processing
+// This function processes queued join requests that were waiting for room initialization
+Awaitable<> ProcessPendingJoins(GameServerHandler* handler, std::shared_ptr<Game>& game, 
+                                 ser::IProtocol* proto) {
+    ZoneScopedN("ProcessPendingJoins");
+    
+    if (!handler || !game || !proto) {
+        lco_return;
+    }
+    
+    handler->peer_->log->info("Starting to process {} pending join requests", game->pending_join.size());
+    
+    while (!game->pending_join.empty()) {
+        auto pending = std::move(game->pending_join.front());
+        game->pending_join.pop_front();
+        
+        auto pending_peer = pending.peer.lock();
+        if (!pending_peer) {
+            handler->peer_->log->debug("Pending peer has disconnected, skipping");
+            continue;
+        }
+        
+        handler->peer_->log->debug("Processing pending join for user: {}", pending.user_id);
+        
+        // Validate that pending player can still join the room
+        const auto [validation_code, validation_msg] = game->validate_join(pending.user_id);
+        if (validation_code != ErrorCodes::Core::Ok) {
+            handler->peer_->log->warn("Pending player {} validation failed: {}", pending.user_id, validation_msg);
+            // Send error response to pending peer through some mechanism
+            // Since we don't have direct handler, we log and skip
+            continue;
+        }
+        
+        // Create game peer for pending player
+        auto game_peer = game->create_peer(pending_peer);
+        if (!game_peer.is_valid()) {
+            handler->peer_->log->error("Failed to create game peer for pending player {}", pending.user_id);
+            continue;
+        }
+        
+        // Add peer to game
+        auto* added_game_peer = game->add_peer(std::move(game_peer));
+        if (!added_game_peer) {
+            handler->peer_->log->error("Failed to add pending player {} to game", pending.user_id);
+            continue;
+        }
+        
+        handler->peer_->log->info("Successfully added pending player {} to game, actor_id={}", 
+                                  pending.user_id, added_game_peer->actor_id);
+        
+        // Apply pending player's actor properties
+        if (pending.actor_props && !pending.actor_props->empty()) {
+            game->insert_actor_props(added_game_peer->actor_id, *pending.actor_props);
+        }
+        
+        // Broadcast join event for the now-added player
+        if (!(game->flags & GameFlags::SuppressRoomEvents)) {
+            std::vector<int32_t> actor_ids;
+            for (auto& peer : game->peers) {
+                actor_ids.push_back(peer.actor_id);
+            }
+            
+            Event event{.code = EventCodes::Join, .sender_actor_id = added_game_peer->actor_id, 
+                       .receivers = ReceiverGroup::All};
+            event.top_params[DictKeyCodes::GameAndActor::ActorList] = &actor_ids;
+            event.top_params[DictKeyCodes::GameAndActor::ActorNo] = added_game_peer->actor_id;
+            
+            if (!(game->flags & GameFlags::SuppressPlayerInfo)) {
+                event.top_params[DictKeyCodes::Properties::ActorProperties] = &added_game_peer->actor_props;
+            }
+            
+            game->broadcast_event(event);
+        }
+        
+        // Flood the pending peer with current game state
+        game->flood_peer(added_game_peer);
+        
+        handler->peer_->log->debug("Completed processing for pending join of user: {}", pending.user_id);
+    }
+    
+    handler->peer_->log->info("Finished processing all pending join requests");
+    lco_return;
+}
+
 } // namespace server

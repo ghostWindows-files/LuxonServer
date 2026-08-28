@@ -23,6 +23,10 @@ public:
 
     const std::shared_ptr<Game>& get_current_game() const { return current_game_; }
 
+    // Public access for pending join processing
+    std::shared_ptr<Peer>& get_peer() { return peer_; }
+    GamePeer*& get_game_peer() { return game_peer_; }
+
 protected:
     std::shared_ptr<Game> current_game_;
     GamePeer *game_peer_{};
