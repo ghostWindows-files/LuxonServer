@@ -6,45 +6,37 @@ on:
 jobs:
   build-windows-x64:
     name: Build Windows x64 Release with MinGW
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
       - name: Install MinGW-w64 (x64)
-        uses: egor-tensin/setup-mingw@v2
+        uses: msys2/setup-msys2@v2
         with:
-          platform: x64
-          version: latest
-
-      - name: Install CMake and Ninja
-        uses: lukka/get-cmake@latest
-        with:
-          cmakeVersion: latest
-          ninjaVersion: latest
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
 
       - name: Fetch Tracy headers
-        shell: powershell
+        shell: msys2 {0}
         run: |
-          if (Test-Path tracy) {
-            Remove-Item -Recurse -Force tracy
-          }
+          if [ -d tracy ]; then rm -rf tracy; fi
           git clone --depth 1 https://github.com/wolfpld/tracy.git tracy
 
       - name: Configure CMake (Release, MinGW x64)
-        shell: bash
+        shell: msys2 {0}
         run: |
           cmake -S . -B build \
-            -G "Unix Makefiles" \
+            -G "Ninja" \
             -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
             -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
       - name: Build Windows x64 binary
-        shell: bash
+        shell: msys2 {0}
         run: |
           cmake --build build --config Release --parallel
           cp build/luxon_server.exe build/luxon_server.release.windows-x86_64.exe
@@ -57,46 +49,46 @@ jobs:
           if-no-files-found: error
 
   build-linux-x64:
-    name: Build Linux x64 Release with MinGW (cross-compile)
-    runs-on: ubuntu-latest
+    name: Build Linux x64 Release with MinGW
+    runs-on: windows-2022
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 cross-compiler and build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            mingw-w64 \
-            cmake \
-            ninja-build \
-            git \
-            build-essential
+      - name: Install MinGW-w64 (x64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
 
       - name: Fetch Tracy headers
+        shell: msys2 {0}
         run: |
-          rm -rf tracy
+          if [ -d tracy ]; then rm -rf tracy; fi
           git clone --depth 1 https://github.com/wolfpld/tracy.git tracy
 
-      - name: Configure CMake (Release, MinGW x64 Linux target)
+      - name: Configure CMake (Release, MinGW x64 for Linux)
+        shell: msys2 {0}
         run: |
           cmake -S . -B build \
             -G "Ninja" \
             -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
             -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
-            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
       - name: Build Linux x64 binary
+        shell: msys2 {0}
         run: |
           cmake --build build --config Release --parallel
-          cp build/luxon_server.exe build/luxon_server.release.linux-x86_64.exe
+          cp build/luxon_server.exe build/luxon_server.release.linux-x86_64
 
       - name: Upload Linux x64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: luxon_server.release.linux-x86_64.exe
-          path: build/luxon_server.release.linux-x86_64.exe
+          name: luxon_server.release.linux-x86_64
+          path: build/luxon_server.release.linux-x86_64
           if-no-files-found: error
