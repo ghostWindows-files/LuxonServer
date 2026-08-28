@@ -1,0 +1,39 @@
+name: Build C++ Photon Windows AMD64
+
+on:
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build C++ Photon Windows release binary
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Fetch Tracy headers
+        shell: pwsh
+        run: git clone --depth 1 https://github.com/wolfpld/tracy.git tracy
+
+      - name: Configure CMake (Release, safe performance optimizations)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>' `
+            -DCMAKE_EXE_LINKER_FLAGS_RELEASE="/OPT:REF /OPT:ICF"
+
+      - name: Build C++ Photon Windows AMD64 binary
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          Copy-Item build\Release\luxon_server.exe build\luxon_server.release.windows-x86_64.exe
+
+      - name: Upload Windows AMD64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxon_server.release.windows-x86_64.exe
+          path: build/luxon_server.release.windows-x86_64.exe
+          if-no-files-found: error
