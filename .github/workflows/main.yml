@@ -1,373 +1,102 @@
-name: Static Build - Windows & Linux
+name: Build C++ with MinGW x64 Release
 
 on:
-  push:
-    branches: [ main, master, develop ]
-    tags:
-      - 'v*'
-  pull_request:
-    branches: [ main, master, develop ]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  checks: write
-  pull-requests: write
-
 jobs:
-  build-windows:
-    name: Build Windows (Static)
+  build-windows-x64:
+    name: Build Windows x64 Release with MinGW
     runs-on: windows-latest
-    strategy:
-      matrix:
-        arch: [x64]
-        config: [Release]
-    
+
     steps:
-      - name: Checkout code
+      - name: Check out source
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
 
-      - name: Setup MSVC
-        uses: microsoft/setup-msbuild@v1
+      - name: Install MinGW-w64 (x64)
+        uses: egor-tensin/setup-mingw@v2
         with:
-          msbuild-version: latest
-          vs-version: latest
+          platform: x64
+          version: latest
 
-      - name: Setup CMake
+      - name: Install CMake and Ninja
         uses: lukka/get-cmake@latest
         with:
-          cmakeVersion: 3.27.x
+          cmakeVersion: latest
+          ninjaVersion: latest
 
-      - name: Create build directory
-        run: mkdir -p build
-
-      - name: Configure CMake (Windows ${{ matrix.arch }})
-        shell: pwsh
-        run: |
-          cd build
-          $vsPath = & "C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $vsVersion = & "C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property catalog_productLineVersion
-          
-          Write-Host "Visual Studio Path: $vsPath"
-          Write-Host "Visual Studio Version: $vsVersion"
-          
-          # Set environment for MSVC
-          $env:PATH = "$vsPath\VC\Tools\MSVC\14.*/bin/Hostx64/x64;$vsPath\Common7\IDE;$env:PATH" -replace "\*", (Get-ChildItem "$vsPath\VC\Tools\MSVC" | Select-Object -Last 1).Name
-          
-          cmake -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_BUILD_TYPE=${{ matrix.config }} `
-            -DCMAKE_CXX_FLAGS="/MT /EHsc /std:c++latest /W4" `
-            -DCMAKE_C_FLAGS="/MT /W4" `
-            -DCMAKE_SHARED_LINKER_FLAGS="/SUBSYSTEM:CONSOLE /ENTRY:mainCRTStartup" `
-            -DCMAKE_EXE_LINKER_FLAGS="/SUBSYSTEM:CONSOLE /ENTRY:mainCRTStartup /STACK:10000000" `
-            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
-            -DLUXON_SERVER_ENABLE_WEBSERVER=ON `
-            -DLUXON_SERVER_ENABLE_PLUGINS=OFF `
-            -DLUXON_SERVER_BUILD_FFI=OFF `
-            ..
-
-      - name: Build Windows
-        shell: cmd
-        run: |
-          cd build
-          cmake --build . --config ${{ matrix.config }} --parallel %NUMBER_OF_PROCESSORS%
-
-      - name: Verify fully static build (Windows)
+      - name: Fetch Tracy headers
         shell: powershell
         run: |
-          $exePath = "build\${{ matrix.config }}\luxon_server.exe"
-          if (-not (Test-Path $exePath)) {
-            Write-Error "Executable not found: $exePath"
-            exit 1
+          if (Test-Path tracy) {
+            Remove-Item -Recurse -Force tracy
           }
-          
-          # Check for DLL dependencies using dumpbin
-          $dependencies = & dumpbin /imports $exePath 2>&1
-          
-          # **STRICT CHECK**: Only system/kernel DLLs are allowed (NO MSVCRT, NO VCRUNTIME)
-          $criticallyForbiddenDLLs = @(
-            "MSVCP140.DLL",
-            "VCRUNTIME140.DLL",
-            "MSVCR120.DLL",
-            "MSVCR110.DLL",
-            "MSVCR100.DLL",
-            "MSVCP120.DLL",
-            "MSVCP110.DLL",
-            "MSVCP100.DLL"
-          )
-          
-          # Strictly allowed minimal system DLLs
-          $allowedDLLs = @(
-            "KERNEL32.DLL",
-            "NTDLL.DLL",
-            "USER32.DLL",
-            "WS2_32.DLL",
-            "ADVAPI32.DLL"
-          )
-          
-          # Extract actual DLL list
-          $actualDLLs = $dependencies | Select-String "^\s+\w+\.dll" | ForEach-Object {
-            ($_ -split '\s+')[1].ToUpper()
-          } | Where-Object { $_ }
-          
-          Write-Output "=== DLL Dependencies Found ==="
-          if ($actualDLLs) {
-            $actualDLLs | ForEach-Object { Write-Output "  - $_" }
-          } else {
-            Write-Output "  (No DLLs)"
-          }
-          Write-Output ""
-          
-          # Check for forbidden DLLs (VC Runtime)
-          $foundForbidden = @()
-          foreach ($dll in $actualDLLs) {
-            if ($dll -in $criticallyForbiddenDLLs) {
-              $foundForbidden += $dll
-            }
-          }
-          
-          if ($foundForbidden.Count -gt 0) {
-            Write-Error "❌ FAIL: Found Visual C++ Runtime DLLs (NOT statically linked):"
-            $foundForbidden | ForEach-Object { Write-Output "  - $_" }
-            Write-Output ""
-            Write-Output "Fix: Ensure /MT flag is used for Release builds"
-            exit 1
-          }
-          
-          # Verify only allowed system DLLs
-          $unexpected = @()
-          foreach ($dll in $actualDLLs) {
-            if ($dll -notin $allowedDLLs -and $dll -notin $criticallyForbiddenDLLs) {
-              $unexpected += $dll
-            }
-          }
-          
-          if ($unexpected.Count -gt 0) {
-            Write-Warning "⚠️ WARNING: Unexpected non-standard DLLs found:"
-            $unexpected | ForEach-Object { Write-Output "  - $_" }
-          }
-          
-          Write-Output "✅ SUCCESS: Static linking verified (NO VC Runtime)"
+          git clone --depth 1 https://github.com/wolfpld/tracy.git tracy
 
-      - name: Get file info
-        shell: powershell
+      - name: Configure CMake (Release, MinGW x64)
+        shell: bash
         run: |
-          $exePath = "build\${{ matrix.config }}\luxon_server.exe"
-          $fileInfo = Get-Item $exePath
-          Write-Output "Executable: $($fileInfo.Name)"
-          Write-Output "Size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
-          Write-Output "Architecture: ${{ matrix.arch }}"
-          Write-Output "Configuration: ${{ matrix.config }}"
+          cmake -S . -B build \
+            -G "Unix Makefiles" \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
-      - name: Upload Windows Build
+      - name: Build Windows x64 binary
+        shell: bash
+        run: |
+          cmake --build build --config Release --parallel
+          cp build/luxon_server.exe build/luxon_server.release.windows-x86_64.exe
+
+      - name: Upload Windows x64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: luxon-server-windows-${{ matrix.arch }}-${{ matrix.config }}
-          path: build/${{ matrix.config }}/luxon_server.exe
-          retention-days: 30
+          name: luxon_server.release.windows-x86_64.exe
+          path: build/luxon_server.release.windows-x86_64.exe
           if-no-files-found: error
 
-  build-linux:
-    name: Build Linux (Static)
+  build-linux-x64:
+    name: Build Linux x64 Release with MinGW (cross-compile)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [x64]
-        config: [Release]
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
 
-      - name: Install build dependencies
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 cross-compiler and build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
+            mingw-w64 \
             cmake \
             ninja-build \
-            pkg-config \
-            libssl-dev \
-            zlib1g-dev
+            git \
+            build-essential
 
-      - name: Setup CMake
-        uses: lukka/get-cmake@latest
-        with:
-          cmakeVersion: 3.27.x
-
-      - name: Create build directory
-        run: mkdir -p build
-
-      - name: Configure CMake (Linux ${{ matrix.arch }})
+      - name: Fetch Tracy headers
         run: |
-          cd build
-          cmake -DCMAKE_CXX_FLAGS="-static-libgcc -static-libstdc++ -std=c++23 -fPIE -Wall -Wextra" \
-                -DCMAKE_C_FLAGS="-static-libgcc -fPIE -Wall -Wextra" \
-                -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
-                -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
-                -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -static -Wl,-z,relro -Wl,-z,now -fPIE -pie" \
-                -DLUXON_SERVER_ENABLE_WEBSERVER=ON \
-                -DLUXON_SERVER_ENABLE_PLUGINS=OFF \
-                -DLUXON_SERVER_BUILD_FFI=OFF \
-                -G Ninja ..
+          rm -rf tracy
+          git clone --depth 1 https://github.com/wolfpld/tracy.git tracy
 
-      - name: Build Linux
+      - name: Configure CMake (Release, MinGW x64 Linux target)
         run: |
-          cd build
-          cmake --build . --config ${{ matrix.config }} --parallel $(nproc)
+          cmake -S . -B build \
+            -G "Ninja" \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
-      - name: Verify fully static build (Linux)
+      - name: Build Linux x64 binary
         run: |
-          BINARY="build/luxon_server"
-          
-          if [ ! -f "$BINARY" ]; then
-            echo "Error: Binary not found at $BINARY"
-            exit 1
-          fi
-          
-          echo "=== Static Binary Verification ==="
-          
-          # Check for ELF format
-          if file "$BINARY" | grep -q "ELF"; then
-            echo "✓ Binary is in ELF format"
-          else
-            echo "❌ FAIL: Binary is not in ELF format"
-            exit 1
-          fi
-          
-          # **STRICT CHECK**: Verify fully static (no dynamic library dependencies)
-          echo ""
-          echo "Checking for dynamic library dependencies..."
-          DEPS=$(ldd "$BINARY" 2>&1 || echo "not a dynamic executable")
-          
-          if echo "$DEPS" | grep -q "not a dynamic executable"; then
-            echo "✅ SUCCESS: Binary is fully statically linked (no runtime dependencies)"
-          else
-            echo "❌ FAIL: Binary has dynamic dependencies:"
-            echo "$DEPS"
-            echo ""
-            echo "Fix: Ensure all libraries are statically linked"
-            exit 1
-          fi
-          
-          # Double-check with file command for static flag
-          if file "$BINARY" | grep -qi "statically linked"; then
-            echo "✓ file command confirms: statically linked"
-          else
-            # Re-verify no dynamic sections
-            if readelf -l "$BINARY" 2>/dev/null | grep -q "INTERP"; then
-              echo "❌ FAIL: Binary has INTERP segment (dynamic loader reference)"
-              exit 1
-            else
-              echo "✓ No INTERP segment (fully static)"
-            fi
-          fi
-          
-          # Check for .NET/Mono/Java/other runtimes
-          if ldd "$BINARY" 2>&1 | grep -iE "(mono|dotnet|clr|java|libc|libstdc|libgcc)" > /dev/null 2>&1; then
-            if echo "$DEPS" | grep -q "not a dynamic executable"; then
-              echo "✓ No external runtime dependencies"
-            else
-              echo "❌ FAIL: Found external runtime dependencies!"
-              exit 1
-            fi
-          fi
-          
-          # Display binary info
-          echo ""
-          echo "=== Binary Information ==="
-          file "$BINARY"
-          echo "Size: $(du -h "$BINARY" | cut -f1)"
-          echo "Architecture: ${{ matrix.arch }}"
-          echo "Configuration: ${{ matrix.config }}"
-          
-          # Check for Position Independent Code (PIE)
-          if readelf -h "$BINARY" 2>/dev/null | grep -q "Type.*EXEC"; then
-            echo "Type: Executable (ET_EXEC)"
-          elif readelf -h "$BINARY" 2>/dev/null | grep -q "Type.*DYN"; then
-            echo "Type: Position Independent (ET_DYN/PIE)"
-          fi
-          
-          echo ""
-          echo "✅ Binary is ready for distribution (fully static, no dependencies)"
+          cmake --build build --config Release --parallel
+          cp build/luxon_server.exe build/luxon_server.release.linux-x86_64.exe
 
-      - name: Upload Linux Build
+      - name: Upload Linux x64 binary
         uses: actions/upload-artifact@v4
         with:
-          name: luxon-server-linux-${{ matrix.arch }}-${{ matrix.config }}
-          path: build/luxon_server
-          retention-days: 30
+          name: luxon_server.release.linux-x86_64.exe
+          path: build/luxon_server.release.linux-x86_64.exe
           if-no-files-found: error
-
-  create-release:
-    name: Create Release
-    needs: [build-windows, build-linux]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release
-          
-          # Organize artifacts
-          for dir in release-artifacts/*/; do
-            name=$(basename "$dir")
-            if [ -f "$dir/luxon_server.exe" ]; then
-              cp "$dir/luxon_server.exe" "release/${name}.exe"
-            elif [ -f "$dir/luxon_server" ]; then
-              cp "$dir/luxon_server" "release/${name}"
-              chmod +x "release/${name}"
-            fi
-          done
-          
-          ls -lah release/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: release/*
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-status:
-    name: Build Status Summary
-    needs: [build-windows, build-linux]
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: Check build status
-        run: |
-          echo "## Build Summary 📊" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Platform | Release | Details |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|---------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows x64 | ✅ | MSVC, Static linked |" >> $GITHUB_STEP_SUMMARY
-          echo "| Linux x64 | ✅ | GCC, Static linked |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Build Options" >> $GITHUB_STEP_SUMMARY
-          echo "- **Webserver**: Enabled" >> $GITHUB_STEP_SUMMARY
-          echo "- **Plugins**: Disabled" >> $GITHUB_STEP_SUMMARY
-          echo "- **FFI**: Disabled" >> $GITHUB_STEP_SUMMARY
-          echo "- **External Dependencies**: None" >> $GITHUB_STEP_SUMMARY
-          echo "- **.NET Runtime**: Not required" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Verification" >> $GITHUB_STEP_SUMMARY
-          echo "✓ All dependencies verified as system/standard libraries" >> $GITHUB_STEP_SUMMARY
-          echo "✓ Static linking verification passed" >> $GITHUB_STEP_SUMMARY
-          echo "✓ No external DLL/runtime dependencies" >> $GITHUB_STEP_SUMMARY
