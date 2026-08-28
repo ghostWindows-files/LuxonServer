@@ -12,12 +12,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 (x64)
+      - name: Install MinGW-w64 and build tools (x64)
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            git
 
       - name: Fetch Tracy headers
         shell: msys2 {0}
@@ -30,8 +34,6 @@ jobs:
         run: |
           cmake -S . -B build \
             -G "Ninja" \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
 
@@ -56,12 +58,16 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install MinGW-w64 (x64)
+      - name: Install MinGW-w64 and build tools (x64)
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            git
 
       - name: Fetch Tracy headers
         shell: msys2 {0}
@@ -74,8 +80,6 @@ jobs:
         run: |
           cmake -S . -B build \
             -G "Ninja" \
-            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
