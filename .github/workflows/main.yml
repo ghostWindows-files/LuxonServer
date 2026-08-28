@@ -1,6 +1,23 @@
 name: Build C++ with MinGW x64 Release
 
 on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-mingw-x64.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
   workflow_dispatch:
 
 jobs:
@@ -37,7 +54,7 @@ jobs:
           cmake -S . -B build \
             -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++ -static-libwinpthread"
 
       - name: Build Windows x64 binary
         shell: msys2 {0}
@@ -86,7 +103,7 @@ jobs:
             -G "Ninja" \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++ -static-libwinpthread"
 
       - name: Build Linux x64 binary
         shell: msys2 {0}
