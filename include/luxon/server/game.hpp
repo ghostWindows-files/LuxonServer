@@ -130,6 +130,32 @@ struct Game : std::enable_shared_from_this<Game> {
     ser::Hashtable custom_props;
     std::vector<std::string> lobby_props;
     std::list<Event> event_cache;
+    
+    // Concurrent join control: prevent race conditions when multiple players join simultaneously
+    bool is_creating = false;
+    
+    // Pending join queue: store players attempting to join while room is initializing
+    struct PendingJoinRequest {
+        std::weak_ptr<Peer> peer;
+        std::string game_id;
+        std::string user_id;
+        ser::HashtablePtr game_props;
+        ser::HashtablePtr actor_props;
+        // Constructor
+        PendingJoinRequest(std::weak_ptr<Peer> p, std::string g, std::string u)
+            : peer(p), game_id(g), user_id(u) {}
+    };
+    std::list<PendingJoinRequest> pending_join;  // Queue of join requests waiting for room initialization
+    
+    // Player state tracking for reconnection support (Phase 4)
+    struct InactivePlayerInfo {
+        int32_t actor_id;
+        std::string user_id;
+        ser::Hashtable actor_props;
+        uint64_t inactive_since = 0;
+        uint32_t generation = 0;
+    };
+    std::unordered_map<std::string, InactivePlayerInfo> inactive_players;
 
     Game(std::shared_ptr<Lobby> lobby, std::string id, std::string_view server_address);
 

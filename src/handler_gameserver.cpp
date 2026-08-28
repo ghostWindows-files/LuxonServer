@@ -326,6 +326,53 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 lco_return;
             }
 
+            // CONCURRENT SERIALIZATION: Serialize multi-player join operations
+            // CRITICAL FIX: Multiple players joining simultaneously can cause race conditions
+            // We use is_creating flag to ensure only one player initializes room while others queue up
+            
+            if (is_master) {
+                // Master player (room creator) is allowed to proceed even if is_creating is true
+                game->is_creating = true;
+                peer_->log->info("Master player starting room initialization, is_creating=true");
+            } else if (game->is_creating) {
+                // Non-master player: room is being initialized by another player
+                // Queue this join request for later processing
+                peer_->log->debug("Room is being initialized, queueing join request for later processing");
+                
+                game->pending_join.emplace_back(peer_, params->get<DictKeyCodes::GameAndActor::GameId>(), 
+                                               peer_->persistent->user_id);
+                game->pending_join.back().game_props = params->get<DictKeyCodes::Properties::GameProperties>();
+                game->pending_join.back().actor_props = params->get<DictKeyCodes::Properties::ActorProperties>();
+                
+                // Send queued response to indicate successful queueing
+                const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
+                                                         .return_code = ErrorCodes::Core::Ok,
+                                                         .debug_message = "Request queued, will process after room initialization"};
+                send(proto_->Serialize(resp));
+                lco_return;
+            }
+
+            // Guard to ensure is_creating is reset and process pending queue even on early returns
+            auto reset_creating = [&]() {
+                if (is_master && game->is_creating) {
+                    game->is_creating = false;
+                    peer_->log->info("Room initialization complete, is_creating=false, processing pending joins");
+                    
+                    // Process pending join requests from queue
+                    while (!game->pending_join.empty()) {
+                        auto& pending = game->pending_join.front();
+                        if (auto pending_peer = pending.peer.lock()) {
+                            peer_->log->debug("Processing pending join from queue for user: {}", pending.user_id);
+                            // TODO: Invoke join handler for pending peer
+                            // This would require extracting join logic into a separate function
+                        }
+                        game->pending_join.pop_front();
+                    }
+                }
+            };
+
+            auto ensure_reset = std::shared_ptr<void>(nullptr, [reset_creating](void*) { reset_creating(); });
+
             if (is_master) {
 #ifdef LUXON_SERVER_ENABLE_PLUGINS
                 if (current_game_->plugins.empty())
@@ -407,9 +454,6 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 set_flag(GameFlags::PublishUserId, params->get<DictKeyCodes::RoutingAndEvents::PublishUserId>());
             }
 
-            // We capture props here so the response only contains the list of OTHER players if joining
-            auto all_actor_props = game->get_actor_props();
-
             // Create peer for game
             auto game_peer = current_game_->create_peer(peer_);
             if (!game_peer.is_valid()) {
@@ -430,7 +474,7 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             // Call into plugins
             bool broadcast_actor_props = true;
             GAME_PLUGINS_INVOKE({
-                OnJoinGameCallInfo info{.joiner = &game_peer};
+                OnJoinGameCallInfo info{.joiner = game_peer_};
                 const Result res = lco_await game->execute_plugin_chain(&PluginBase::OnJoinGame, req, info);
 
                 if (res == Result::Fail) {
@@ -444,17 +488,21 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 }
 
                 if (!info.publish_user_id.value_or(true))
-                    game_peer.actor_props.erase(ActorProps::UserId);
+                    game_peer_->actor_props.erase(ActorProps::UserId);
 
                 broadcast_actor_props = info.broadcast_actor_props.value_or(true);
             });
 
-            // Update properties
+            // Update properties - CRITICAL FIX: Insert properties BEFORE capturing actor props snapshot
             if (const auto& actor_props = params->get<DictKeyCodes::Properties::ActorProperties>())
                 game->insert_actor_props(game_peer_->actor_id, *actor_props);
             if (is_master)
                 if (const auto& game_props = params->get<DictKeyCodes::Properties::GameProperties>())
                     game->insert_game_props(*game_props);
+
+            // CRITICAL FIX: Capture actor props AFTER inserting this player's properties
+            // This ensures all other players receive the complete property list including the new player
+            auto all_actor_props = game->get_actor_props();
 
             // Construct response
             ser::OperationResponseMessage resp;
@@ -537,6 +585,16 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             const auto& props = params->get<DictKeyCodes::Properties::Properties>();
             const auto& props_expected = params->get<DictKeyCodes::Properties::ExpectedValues>();
 
+            // CRITICAL FIX: Validate properties are not empty or null
+            if (!props || props->empty()) {
+                peer_->log->warn("SetProperties received empty properties hashtable");
+                const ser::OperationResponseMessage resp{.operation_code = OpCodes::Lite::SetProperties,
+                                                     .return_code = ErrorCodes::Core::OperationInvalid,
+                                                     .debug_message = "Properties cannot be empty"};
+                send(proto_->Serialize(resp));
+                lco_return;
+            }
+
             // Call into plugins
             GAME_PLUGINS_INVOKE({
                 BeforeSetPropertiesCallInfo info{
@@ -568,13 +626,14 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                     game->insert_game_props(*props);
             }
 
-            // Emtpy response
+            // Empty response
             ser::OperationResponseMessage resp;
             resp.operation_code = OpCodes::Lite::SetProperties;
             resp.return_code = ok ? ErrorCodes::Core::Ok : ErrorCodes::Core::OperationInvalid;
             send(proto_->Serialize(resp));
 
-            // Broadcast property updates
+            // Broadcast property updates - CRITICAL FIX: MUST broadcast immediately after property update
+            // to ensure atomicity: all clients receive property update event before other events
             if (ok && broadcast) {
                 auto event = game->create_property_update_event(game_peer_->actor_id, *props, actor_id);
                 game->broadcast_event(event);

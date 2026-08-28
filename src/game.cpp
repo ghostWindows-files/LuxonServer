@@ -238,9 +238,58 @@ bool Game::flood_peer(GamePeer *game_peer) {
     if (auto peer = game_peer->peer.lock()) {
         size_t count = 0;
 
+        // CRITICAL FIX: First, send the current property state as a property update event
+        // This ensures the new player receives all current room and actor properties BEFORE
+        // other cached events, preventing NullReferenceException when accessing properties
+        {
+            auto current_game_props = get_game_props();
+            auto current_actor_props = get_actor_props();
+
+            // Send room properties update (actor_id = 0)
+            if (!current_game_props.empty()) {
+                Event props_event{.code = EventCodes::PropertiesUpdate,
+                                 .sender_actor_id = 0,  // System event
+                                 .receivers = game_peer->actor_id,
+                                 .delivery_mode = enet::EnetDeliveryMode::Reliable};
+                props_event.top_params[DictKeyCodes::GameAndActor::ActorNo] = static_cast<int32_t>(0);
+                props_event.top_params[DictKeyCodes::RoutingAndEvents::Data] = std::make_shared<ser::Hashtable>(current_game_props);
+
+                const auto expected_props_payload = props_event.get_cached_data(*peer->protocol);
+                if (!expected_props_payload)
+                    peer->log->warn("Failed to serialize game properties flood event: {}", expected_props_payload.error().message);
+                else
+                    peer->send(*expected_props_payload, enet::EnetSendOptions{.channel = 0, .mode = enet::EnetDeliveryMode::Reliable});
+
+                ++count;
+            }
+
+            // Send actor properties update
+            if (!current_actor_props.empty()) {
+                Event props_event{.code = EventCodes::PropertiesUpdate,
+                                 .sender_actor_id = 0,  // System event
+                                 .receivers = game_peer->actor_id,
+                                 .delivery_mode = enet::EnetDeliveryMode::Reliable};
+                props_event.top_params[DictKeyCodes::GameAndActor::ActorNo] = static_cast<int32_t>(1);  // Non-zero means actor properties
+                props_event.top_params[DictKeyCodes::RoutingAndEvents::Data] = std::make_shared<ser::Hashtable>(current_actor_props);
+
+                const auto expected_props_payload = props_event.get_cached_data(*peer->protocol);
+                if (!expected_props_payload)
+                    peer->log->warn("Failed to serialize actor properties flood event: {}", expected_props_payload.error().message);
+                else
+                    peer->send(*expected_props_payload, enet::EnetSendOptions{.channel = 0, .mode = enet::EnetDeliveryMode::Reliable});
+
+                ++count;
+            }
+        }
+
+        // Then send other cached events
         for (const auto& event : event_cache) {
             // Actor events don't go back to the sender
             if (event.sender_actor_id != 0 && event.sender_actor_id == game_peer->actor_id)
+                continue;
+
+            // Skip PropertiesUpdate events in cache - we already sent current state above
+            if (event.code == EventCodes::PropertiesUpdate)
                 continue;
 
             // Cached events are re-sent as if they were fresh to the joining player
@@ -253,7 +302,7 @@ bool Game::flood_peer(GamePeer *game_peer) {
             ++count;
         }
 
-        peer->log->info("Client successfully flooded with {} events", count);
+        peer->log->info("Client successfully flooded with {} events (including current property state)", count);
         return true;
     }
     return false;
