@@ -25,7 +25,6 @@ public:
 
     // Public access for pending join processing
     std::shared_ptr<Peer>& get_peer() { return peer_; }
-    GamePeer*& get_game_peer() { return game_peer_; }
 
 protected:
     std::shared_ptr<Game> current_game_;
