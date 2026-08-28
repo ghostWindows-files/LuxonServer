@@ -249,8 +249,8 @@ bool Game::flood_peer(GamePeer *game_peer) {
             if (!current_game_props.empty()) {
                 Event props_event{.code = EventCodes::PropertiesUpdate,
                                  .sender_actor_id = 0,  // System event
-                                 .receivers = std::unordered_set<int32_t>{game_peer->actor_id},
-                                 .delivery_mode = enet::EnetDeliveryMode::Reliable};
+                                 .delivery_mode = enet::EnetDeliveryMode::Reliable,
+                                 .receivers = std::unordered_set<int32_t>{game_peer->actor_id}};
                 props_event.top_params[DictKeyCodes::GameAndActor::ActorNo] = static_cast<int32_t>(0);
                 props_event.top_params[DictKeyCodes::RoutingAndEvents::Data] = std::make_shared<ser::Hashtable>(current_game_props);
 
@@ -267,8 +267,8 @@ bool Game::flood_peer(GamePeer *game_peer) {
             if (!current_actor_props.empty()) {
                 Event props_event{.code = EventCodes::PropertiesUpdate,
                                  .sender_actor_id = 0,  // System event
-                                 .receivers = std::unordered_set<int32_t>{game_peer->actor_id},
-                                 .delivery_mode = enet::EnetDeliveryMode::Reliable};
+                                 .delivery_mode = enet::EnetDeliveryMode::Reliable,
+                                 .receivers = std::unordered_set<int32_t>{game_peer->actor_id}};
                 props_event.top_params[DictKeyCodes::GameAndActor::ActorNo] = static_cast<int32_t>(1);  // Non-zero means actor properties
                 props_event.top_params[DictKeyCodes::RoutingAndEvents::Data] = std::make_shared<ser::Hashtable>(current_actor_props);
 
