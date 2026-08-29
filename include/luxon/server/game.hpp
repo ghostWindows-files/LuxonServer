@@ -105,12 +105,12 @@ struct Event {
 
     mutable std::array<ser::ByteArray, static_cast<size_t>(ser::ProtocolImplID::__length)> cached_data;
     // Event packets can be serialized concurrently for several recipients.
+    // Event must remain an aggregate: the designated-initializer call sites
+    // and the implicit default constructor both depend on it. The implicitly
+    // generated copy/move share cache_mutex between copies, which is exactly
+    // what the cache protocol requires.
     mutable std::shared_ptr<std::mutex> cache_mutex = std::make_shared<std::mutex>();
 
-    Event(const Event&) = default;
-    Event& operator=(const Event&) = default;
-    Event(Event&&) noexcept = default;
-    Event& operator=(Event&&) noexcept = default;
     std::expected<ser::ByteArray, ser::Error> get_cached_data(ser::IProtocol& protocol) const;
 
     ser::Hashtable& make_params_hashtable() { return *(data = std::make_shared<ser::Hashtable>()).get<ser::HashtablePtr>(); }

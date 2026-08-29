@@ -793,10 +793,14 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 }
                 // The list node pointer handed to the plugin may have been
                 // retired while awaiting; re-resolve through the actor id.
-                const auto current_actor = game->actor_id_for_peer(peer_);
-                game_peer_ = current_actor && *current_actor == joined_actor_id
-                                 ? game->find_peer(joined_actor_id)
-                                 : nullptr;
+                // find_peer() must be called with admission_mutex held.
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    const auto current_actor = game->actor_id_for_peer(peer_);
+                    game_peer_ = current_actor && *current_actor == joined_actor_id
+                                     ? game->find_peer(joined_actor_id)
+                                     : nullptr;
+                }
                 if (!game_peer_) {
                     rollback_join();
                     if (is_master)

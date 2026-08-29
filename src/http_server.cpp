@@ -790,7 +790,6 @@ json HttpServer::route_request(std::string_view method, std::string path) {
             // /apps/{app}/games/{game_id}/actors
             if (segs.size() == 5 && segs[4] == "actors") {
                 json res = json::array();
-                const ser::Hashtable all_actor_props = game->get_actor_props();
                 std::lock_guard admission_lock(game->admission_mutex);
                 for (auto& gp : game->peers) {
                     if (!gp.active)
