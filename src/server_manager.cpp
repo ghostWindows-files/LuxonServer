@@ -818,9 +818,11 @@ void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
         if (const auto token = params[DictKeyCodes::LoadBalancing::Token].get_ptr<std::string>()) {
             // A consume without revision is a legacy message; with revision, only
             // drop copies that are not newer than the consumed store generation.
-            if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<uint64_t>())
+            // ser::Value has no uint64_t alternative, so revisions travel as
+            // int64_t; negative values are malformed and ignored.
+            if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<int64_t>(); revision && *revision >= 0)
                 std::erase_if(peer_persistent_data, [token, revision](const auto& peer) {
-                    return peer->token == *token && peer->store_generation <= *revision;
+                    return peer->token == *token && peer->store_generation <= static_cast<uint64_t>(*revision);
                 });
             else
                 std::erase_if(peer_persistent_data, [token](const auto& peer) { return peer->token == *token; });
@@ -896,11 +898,13 @@ void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
             }
 
             // Drop out-of-order updates so a delayed old snapshot can never
-            // overwrite newer creation state on this process.
+            // overwrite newer creation state on this process. Revisions travel
+            // as int64_t (ser::Value has no uint64_t alternative); negative
+            // values are malformed and treated as absent.
             uint64_t remote_revision = 0;
             bool has_remote_revision = false;
-            if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<uint64_t>()) {
-                remote_revision = *revision;
+            if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<int64_t>(); revision && *revision >= 0) {
+                remote_revision = static_cast<uint64_t>(*revision);
                 has_remote_revision = true;
                 if (!is_new && game->state_revision() > remote_revision) {
                     log_->warn("Dropping out-of-order IPC GameUpdate for game '{}' (local revision {}, remote {})",
@@ -972,10 +976,10 @@ void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
         pp->user_id = user_id;
         if (const auto ttl = params[DictKeyCodes::GameSettings::PlayerTTL].get_ptr<int32_t>())
             pp->reconnect_ttl_ms = *ttl;
-        if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<uint64_t>()) {
+        if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<int64_t>(); revision && *revision >= 0) {
             // Ignore stale stores so a delayed re-route can never resurrect a
             // token that another process has already consumed.
-            const auto stored_revision = *revision;
+            const auto stored_revision = static_cast<uint64_t>(*revision);
             bool has_newer = false;
             for (const auto& existing : peer_persistent_data)
                 if (existing->token == token && existing->store_generation > stored_revision) {

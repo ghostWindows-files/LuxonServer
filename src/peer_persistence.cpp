@@ -67,7 +67,7 @@ std::unique_ptr<PeerPersistent> load_persistent_peer(ServerManager& server_manag
         luxon::ser::EventMessage msg;
         msg.event_code = IPCEventCodes::PersistentPeerConsume;
         msg.parameters[DictKeyCodes::LoadBalancing::Token] = fres->token;
-        msg.parameters[IPCDictKeyCodes::Revision] = fres->store_generation;
+        msg.parameters[IPCDictKeyCodes::Revision] = static_cast<int64_t>(fres->store_generation);
         server_manager.ipc_broadcast(msg);
 #endif
         if (refresh_token)
@@ -104,7 +104,7 @@ void sync_persistent_peer(ServerManager& server_manager, const PeerPersistent& p
     msg.parameters[DictKeyCodes::LoadBalancing::Token] = pp.token;
     msg.parameters[DictKeyCodes::LoadBalancing::UserId] = pp.user_id;
     msg.parameters[DictKeyCodes::GameSettings::PlayerTTL] = pp.reconnect_ttl_ms;
-    msg.parameters[IPCDictKeyCodes::Revision] = pp.store_generation;
+    msg.parameters[IPCDictKeyCodes::Revision] = static_cast<int64_t>(pp.store_generation);
     if (pp.has_invitation())
         pp.get_invitation().encode_game_info(msg.parameters);
     else if (pp.app)

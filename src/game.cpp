@@ -806,7 +806,9 @@ void Game::trigger_lobby_update() {
     ipc_event.event_code = IPCEventCodes::GameUpdate;
     add_game_info(ipc_event.parameters);
     ipc_event.parameters[DictKeyCodes::RoutingAndEvents::Broadcast] = created;
-    ipc_event.parameters[IPCDictKeyCodes::Revision] = revision;
+    // ser::Value has no uint64_t alternative; revisions travel as int64_t
+    // across IPC and are re-widened by the receiver.
+    ipc_event.parameters[IPCDictKeyCodes::Revision] = static_cast<int64_t>(revision);
     ipc_event.parameters[IPCDictKeyCodes::IsCreating] = creating;
     {
         std::vector<std::string> expected_users_snapshot;
