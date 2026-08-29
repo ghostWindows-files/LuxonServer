@@ -574,15 +574,25 @@ std::string_view ServerManager::get_random_server_address(ServerType server_type
 void ServerManager::run_scheduled_tasks() {
     ZoneScoped;
 
-    if (scheduled_tasks_.empty())
-        return;
+    std::function<void()> callback;
+#ifdef LUXON_SERVER_MULTITHREADED
+    {
+        std::scoped_lock lock(scheduled_tasks_mutex_);
+#endif
+        if (scheduled_tasks_.empty())
+            return;
 
-    const auto& task = scheduled_tasks_.top();
-    if (task.execution_time < startup_time_.get()) {
-        auto callback = task.cb;
-        scheduled_tasks_.pop();
-        callback();
+        const auto& task = scheduled_tasks_.top();
+        if (task.execution_time < startup_time_.get()) {
+            callback = task.cb;
+            scheduled_tasks_.pop();
+        }
+#ifdef LUXON_SERVER_MULTITHREADED
     }
+#endif
+
+    if (callback)
+        callback();
 }
 
 void ServerManager::stun_keepalive(enet::EnetServer& server, uint16_t port) {
@@ -743,6 +753,10 @@ std::expected<std::shared_ptr<Game>, std::string> ServerManager::get_game(Lobby&
     return *game;
 }
 
+bool ServerManager::has_persistent_peer(std::string_view token) const {
+    return std::ranges::any_of(peer_persistent_data, [token](const auto& peer) { return peer->token == token; });
+}
+
 #ifdef LUXON_SERVER_ENABLE_MULTIPROCESSING
 void ServerManager::ipc_broadcast(const ser::Message& message, bool parent, bool children) {
     if (parent)
@@ -799,6 +813,21 @@ void ServerManager::process_parent_ipc_message(IPC& sender, const ser::Message& 
 
 void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
     const auto& params = event_msg.parameters;
+
+    if (event_msg.event_code == IPCEventCodes::PersistentPeerConsume) {
+        if (const auto token = params[DictKeyCodes::LoadBalancing::Token].get_ptr<std::string>()) {
+            // A consume without revision is a legacy message; with revision, only
+            // drop copies that are not newer than the consumed store generation.
+            if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<uint64_t>())
+                std::erase_if(peer_persistent_data, [token, revision](const auto& peer) {
+                    return peer->token == *token && peer->store_generation <= *revision;
+                });
+            else
+                std::erase_if(peer_persistent_data, [token](const auto& peer) { return peer->token == *token; });
+        } else
+            log_->error("Failed to consume persistent peer received via IPC: Could not get token string");
+        return;
+    }
 
     // Handle lobby/game updates
     if (event_msg.event_code == IPCEventCodes::GameUpdate || event_msg.event_code == IPCEventCodes::GameDelete) {
@@ -859,6 +888,44 @@ void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
                         log_->error("Failed to synchronize game via IPC: Unable to create matching game");
                         return;
                     }
+                } else {
+                    log_->error("Failed to synchronize game via IPC: {}: {}",
+                                game_info.id, expected_game.error().debug_message.value_or("Unknown error"));
+                    return;
+                }
+            }
+
+            // Drop out-of-order updates so a delayed old snapshot can never
+            // overwrite newer creation state on this process.
+            uint64_t remote_revision = 0;
+            bool has_remote_revision = false;
+            if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<uint64_t>()) {
+                remote_revision = *revision;
+                has_remote_revision = true;
+                if (!is_new && game->state_revision() > remote_revision) {
+                    log_->warn("Dropping out-of-order IPC GameUpdate for game '{}' (local revision {}, remote {})",
+                               game->id, game->state_revision(), remote_revision);
+                    return;
+                }
+            }
+
+            {
+                std::lock_guard admission_lock(game->admission_mutex);
+                // Apply updated creation state before the optional property payload.
+                if (const auto created = params[DictKeyCodes::RoutingAndEvents::Broadcast].get_ptr<bool>())
+                    game->is_created.store(*created, std::memory_order_release);
+                if (const auto creating = params[IPCDictKeyCodes::IsCreating].get_ptr<bool>())
+                    game->is_creating.store(*creating, std::memory_order_release);
+                if (const auto visible = params[IPCDictKeyCodes::IsVisible].get_ptr<bool>())
+                    game->is_visible = *visible;
+                if (has_remote_revision)
+                    game->state_revision_ = remote_revision;
+                if (const auto expected_users = params[IPCDictKeyCodes::ExpectedUsers].get_ptr<std::vector<std::string>>()) {
+                    std::vector<std::string> previous_expected_users(game->expected_users.begin(), game->expected_users.end());
+                    for (const auto& expected_user : previous_expected_users)
+                        game->remove_expected_user(expected_user);
+                    for (const auto& expected_user : *expected_users)
+                        game->reserve_expected_user(expected_user);
                 }
             }
 
@@ -868,8 +935,6 @@ void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
                 // Handle PlayerCount separately
                 if (auto it = props_ptr->find(GameProps::PlayerCount); it != props_ptr->end())
                     it->second.store_if<uint8_t>(game->dummy_peer_count);
-                if (game->dummy_peer_count > 0)
-                    game->is_created = true;
 
                 // Apply all other properties
                 game->insert_game_props(*props_ptr);
@@ -905,6 +970,22 @@ void ServerManager::process_ipc_event(const ser::EventMessage& event_msg) {
         auto pp = create_persistent_peer();
         pp->token = token;
         pp->user_id = user_id;
+        if (const auto ttl = params[DictKeyCodes::GameSettings::PlayerTTL].get_ptr<int32_t>())
+            pp->reconnect_ttl_ms = *ttl;
+        if (const auto revision = params[IPCDictKeyCodes::Revision].get_ptr<uint64_t>()) {
+            // Ignore stale stores so a delayed re-route can never resurrect a
+            // token that another process has already consumed.
+            const auto stored_revision = *revision;
+            bool has_newer = false;
+            for (const auto& existing : peer_persistent_data)
+                if (existing->token == token && existing->store_generation > stored_revision) {
+                    has_newer = true;
+                    break;
+                }
+            if (has_newer)
+                return;
+            pp->store_generation = stored_revision;
+        }
 
         const auto game_info = Game::decode_game_info(params);
         pp->app = get_app(game_info.lobby.app);
@@ -976,13 +1057,13 @@ void ServerManager::setup() {
             auto handler = ServerTypeToHandler(config.type, *this, std::move(peer));
             handler->set_allow_unsolicited(config.allow_unsolicited);
 
-            // Handler pointer must be owning with plugins enabled to ensure no destruction while coroutine is active
-
-            auto *handler_ptr = handler.get();
-            auto *raw_handler = GetRawPointer(handler_ptr);
+            // Detached ENet coroutines take a strong reference only for the
+            // duration of the callback; the transport callback itself must not
+            // form a handler/peer ownership cycle.
+            std::weak_ptr<HandlerBase> handler_weak = handler;
 
             // Install callbacks
-            enetPeer->on_log_message = [this, handler = raw_handler](enet::LogLevel enet_level, std::string_view message) {
+            enetPeer->on_log_message = [this, handler_weak](enet::LogLevel enet_level, std::string_view message) {
                 // Convert log level
                 log_level level;
                 switch (enet_level) {
@@ -995,34 +1076,50 @@ void ServerManager::setup() {
                 }
 
                 // Emit log message
-                handler->get_peer()->log->log(level, "[ENet] {}", message);
+                if (auto handler = handler_weak.lock())
+                    if (auto peer = handler->get_peer())
+                        peer->log->log(level, "[ENet] {}", message);
             };
 
-            enetPeer->on_state_changed = [this, handler = raw_handler](enet::EnetConnectionState state) {
-                [](ServerManager& self, enet::EnetConnectionState state, server::HandlerBase *handler) -> Awaitable<> {
+            enetPeer->on_state_changed = [this, handler_weak](enet::EnetConnectionState state) {
+                [](ServerManager& self, enet::EnetConnectionState state, std::shared_ptr<server::HandlerBase> handler) -> Awaitable<> {
+                    if (!handler)
+                        lco_return;
+
                     try {
                         lco_await handler->HandleENetConnectionStateChange(state);
                     } catch (const std::exception& e) {
-                        auto& peer = *handler->get_peer();
-                        peer.log->warn("Uncaught exception in ENet connect state change handler: {}", e.what());
+                        if (auto peer = handler->get_peer())
+                            peer->log->warn("Uncaught exception in ENet connect state change handler: {}", e.what());
                     }
+
+                    if (!handler)
+                        lco_return;
 
                     if (state == luxon::enet::EnetConnectionState::Connected)
                         lco_await handler->HandleConnect();
 
                     if (state == enet::EnetConnectionState::Disconnected) {
+                        if (auto game_handler = dynamic_cast<GameServerHandler *>(handler.get()))
+                            game_handler->mark_disconnected();
                         lco_await handler->HandleDisconnect();
-                        // Self-destruct handler, this will invalidate the pointer
-                        self.add_scheduled_task(0, [&self, handler]() { self.connections_.remove_if([handler](auto& v) { return v.get() == handler; }); });
+                        // The coroutine owns the handler; remove the manager's owner only after cleanup.
+                        self.add_scheduled_task(0, [&self, handler = handler.get()]() {
+                            self.connections_.remove_if([handler](auto& v) { return v.get() == handler; });
+                        });
                     }
-                }(*this, state, handler)_lco_detached;
+                }(*this, state, handler_weak.lock())_lco_detached;
             };
 
 
-            enetPeer->on_payload_command = [this, handler_capture = handler_ptr](enet::EnetCommand&& cmd) {
-                [](ServerManager& self, enet::EnetCommand cmd, auto h_token) -> Awaitable<> {
-                    auto *handler = h_token;
-                    auto& peer = handler->get_peer();
+            enetPeer->on_payload_command = [this, handler_weak](enet::EnetCommand&& cmd) {
+                [](ServerManager& self, enet::EnetCommand cmd, std::shared_ptr<server::HandlerBase> handler) -> Awaitable<> {
+                    if (!handler)
+                        lco_return;
+                    auto peer = handler->get_peer();
+                    if (!peer)
+                        lco_return;
+
 
 #ifdef LUXON_SERVER_ENABLE_VISUALIZER
                     peer->log->trace("Received message using mode {} on channel {}:", static_cast<int>(enet::FlagsToEnetDeliveryMode(cmd.header.flags)),
@@ -1041,7 +1138,7 @@ void ServerManager::setup() {
                         peer->log->critical("Disconnecting due to uncaught exception in ENet command handler: {}", e.what());
                         peer->disconnect();
                     }
-                }(*this, std::move(cmd), std::move(handler_capture))_lco_detached;
+                }(*this, std::move(cmd), handler_weak.lock())_lco_detached;
             };
 
             // Add to connection list

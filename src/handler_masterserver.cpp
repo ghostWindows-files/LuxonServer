@@ -41,7 +41,8 @@ using ClientSettings = Model<Parameter<bool, AuthAndLobby::LobbyStats, true>>;
 using LobbyId = Model<Parameter<std::string, AuthAndLobby::LobbyName, false, DefaultString<"">>,
                       Parameter<LobbyType::Enum, AuthAndLobby::LobbyType, false, DefaultConst<LobbyType::Default>>>;
 
-using CreateGame = Model<Parameter<std::string, GameAndActor::GameId, false, DefaultString<"">>>;
+using CreateGame = Model<Parameter<std::string, GameAndActor::GameId, false, DefaultString<"">>,
+                         Parameter<std::vector<std::string>, GameProps::ExpectedUsers, false, DefaultInit>>;
 using JoinGame = ExtendedModel<CreateGame, Parameter<uint8_t, AuthAndLobby::CreateIfNotExists, false, DefaultConst<false>>>;
 
 using SqlQuery = Model<Parameter<std::string, RoutingAndEvents::Data, false, DefaultString<"">>>;
@@ -57,8 +58,51 @@ using FindFriends = Model<Parameter<std::vector<std::string>, AuthAndLobby::Find
 using LobbyStats = Model<Parameter<std::string, DictKeyCodes::AuthAndLobby::LobbyName, true>, Parameter<uint8_t, DictKeyCodes::AuthAndLobby::LobbyType, true>>;
 } // namespace models
 
+Awaitable<> MasterServerHandler::HandleDisconnect() {
+    pending_join_.reset();
+
+    // Release reservations this handler created but never routed, so a
+    // dropped matchmaking request cannot block capacity for the whole TTL.
+    for (const auto& [weak_game, reservation] : owned_reservations_) {
+        if (auto game = weak_game.lock())
+            game->remove_expected_user_if_generation(reservation.first, reservation.second);
+    }
+    owned_reservations_.clear();
+
+    lco_await HandlerBase::HandleDisconnect();
+}
+
 void MasterServerHandler::HandleSlowUpdate() {
     ZoneScoped;
+
+    if (pending_join_) {
+        const auto pending_game = pending_join_->game;
+        const bool generation_changed = pending_game && pending_join_->creation_generation != 0 &&
+                                        pending_game->active_creation_generation() != pending_join_->creation_generation;
+        const bool creation_aborted = pending_game &&
+                                      !pending_game->is_created.load(std::memory_order_acquire) &&
+                                      !pending_game->is_creating.load(std::memory_order_acquire);
+        if (pending_game && pending_game->is_created.load(std::memory_order_acquire) &&
+            !pending_game->is_creating.load(std::memory_order_acquire) && !generation_changed) {
+            auto pending_join = std::move(*pending_join_);
+            pending_join_.reset();
+            HandleOperationRequest(std::move(pending_join.request), pending_join.is_encrypted,
+                                   pending_join.command_header)_lco_detached;
+            return;
+        }
+
+        if (!pending_game || creation_aborted || generation_changed || pending_join_->wait_started.get() >= 5000) {
+            const ser::OperationResponseMessage resp{
+                .operation_code = pending_join_->request.operation_code,
+                .return_code = ErrorCodes::Matchmaking::GameIdNotExists,
+                .debug_message = creation_aborted ? "Game creation was aborted" :
+                                 (generation_changed ? "Game creation attempt expired" :
+                                  (pending_game ? "Game creation timed out" : "Game no longer exists"))};
+            send(proto_->Serialize(resp, pending_join_->is_encrypted),
+                 enet::EnetSendOptions{.channel = pending_join_->command_header.channel_id});
+            pending_join_.reset();
+        }
+    }
 
     if (last_batched_update_.get() > 5000) {
         // Send app stats
@@ -73,9 +117,15 @@ void MasterServerHandler::HandleSlowUpdate() {
                 switch (static_cast<GameListUpdate::Type>(game_variant.index())) {
                 case GameListUpdate::Update: {
                     const auto game = std::get<std::weak_ptr<Game>>(game_variant).lock();
-                    if (game && game->is_visible)
-                        if (auto [element, inserted] = game_list->emplace(game->id, ser::null); inserted)
-                            element->second = std::make_shared<ser::Hashtable>(game->get_lobby_game_props());
+                    if (game) {
+                        auto game_props = std::make_shared<ser::Hashtable>();
+                        const auto state = game->get_config_snapshot();
+                        if (state.is_created && state.is_visible)
+                            *game_props = game->get_lobby_game_props();
+                        else
+                            (*game_props)[GameProps::Removed] = true;
+                        (*game_list)[game->id] = std::move(game_props);
+                    }
                 } break;
                 case GameListUpdate::Delete: {
                     const auto& game_id = std::get<std::string>(game_variant);
@@ -263,8 +313,11 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                 const auto& games = app.get_games();
                 for (const auto& id : game_ids)
                     if (auto res = games.find(id); res != games.end())
-                        if (auto game = res->second.lock())
-                            game_list->emplace(id, std::make_shared<ser::Hashtable>(game->get_lobby_game_props()));
+                        if (auto game = res->second.lock()) {
+                            const auto state = game->get_config_snapshot();
+                            if (state.is_created && state.is_visible)
+                                game_list->emplace(id, std::make_shared<ser::Hashtable>(game->get_lobby_game_props()));
+                        }
 
                 resp.parameters[DictKeyCodes::LoadBalancing::GameList] = game_list;
                 resp.return_code = ErrorCodes::Core::Ok;
@@ -327,13 +380,26 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
             resp.parameters[DictKeyCodes::LoadBalancing::Token] = peer_->persistent->token;
             resp.parameters[DictKeyCodes::GameAndActor::GameId] = game->id;
 
+            // Reserve users before routing so the GameServer sees the same capacity state.
+            for (const auto& expected_user : params->get<GameProps::ExpectedUsers>()) {
+                if (expected_user.empty() || expected_user == peer_->persistent->user_id)
+                    continue;
+                if (const auto generation = game->reserve_expected_user_with_generation(expected_user))
+                    owned_reservations_.emplace_back(game, std::make_pair(expected_user, *generation));
+            }
+
             // Synchronize game, peer and token
             peer_->log->info("Joining newly created game: {}", game->id);
+            const std::string created_game_id = game->id;
             peer_->persistent->invite(std::move(game), true);
             sync_persistent_peer(server_manager_, *peer_->persistent);
+            store_persistent_peer(server_manager_, std::move(peer_->persistent));
 
             // Send response
+            resp.parameters[DictKeyCodes::GameAndActor::GameId] = created_game_id;
             send(proto_->Serialize(resp));
+            // Routed: reservation cleanup is now owned by the GameServer and TTLs.
+            owned_reservations_.clear();
 
             lco_return;
         }
@@ -401,9 +467,50 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                 lco_return;
             }
 
-            // Validate join
-            if (!is_new) {
-                const auto [join_validation_code, join_validation_message] = game->validate_join(peer_->persistent->user_id);
+            const uint8_t join_mode = params->get<DictKeyCodes::AuthAndLobby::CreateIfNotExists>();
+            const bool create_if_not_exists = join_mode == 1;
+            const bool rejoin_only = join_mode == 3;
+            const auto& expected_users = params->get<GameProps::ExpectedUsers>();
+
+            if (rejoin_only && (!game->is_created.load(std::memory_order_acquire) ||
+                                 !game->has_expected_user(peer_->persistent->user_id))) {
+                const ser::OperationResponseMessage resp{.operation_code = OpCodes::Matchmaking::JoinGame,
+                                                         .return_code = ErrorCodes::Matchmaking::GameIdNotExists,
+                                                         .debug_message = "Rejoiner does not exist"};
+                send(proto_->Serialize(resp));
+                lco_return;
+            }
+
+            // A dead placeholder (neither created nor creating) can never be
+            // joined; only a live creation attempt may enter pending replay.
+            if (!is_new && !game->is_created.load(std::memory_order_acquire) && !create_if_not_exists) {
+                if (!game->is_creating.load(std::memory_order_acquire)) {
+                    const ser::OperationResponseMessage resp{.operation_code = OpCodes::Matchmaking::JoinGame,
+                                                             .return_code = ErrorCodes::Matchmaking::GameIdNotExists,
+                                                             .debug_message = "Game creation is not active"};
+                    send(proto_->Serialize(resp));
+                    lco_return;
+                }
+                if (pending_join_) {
+                    const ser::OperationResponseMessage resp{.operation_code = OpCodes::Matchmaking::JoinGame,
+                                                             .return_code = ErrorCodes::Core::OperationNotAllowedInCurrentState,
+                                                             .debug_message = "Join already pending"};
+                    send(proto_->Serialize(resp));
+                    lco_return;
+                }
+
+                pending_join_.emplace(PendingJoin{.game = game,
+                                                   .creation_generation = game->active_creation_generation(),
+                                                   .request = std::move(req),
+                                                   .is_encrypted = is_encrypted,
+                                                   .command_header = cmd_header});
+                lco_return;
+            }
+
+            // Validate only a fully-created existing room. A create-if-not-exists request owns the placeholder.
+            if (!is_new && game->is_created.load(std::memory_order_acquire)) {
+                const auto [join_validation_code, join_validation_message] =
+                    game->validate_join(peer_->persistent->user_id, expected_users);
                 if (join_validation_code != ErrorCodes::Core::Ok) {
                     const ser::OperationResponseMessage resp{.operation_code = OpCodes::Matchmaking::JoinGame,
                                                              .return_code = join_validation_code,
@@ -413,8 +520,15 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                 }
             }
 
-            // Expect user
-            game->expected_users.emplace(peer_->persistent->user_id);
+            // Expect user and remove the reservation after one reconnect window.
+            if (const auto generation = game->reserve_expected_user_with_generation(peer_->persistent->user_id))
+                owned_reservations_.emplace_back(game, std::make_pair(peer_->persistent->user_id, *generation));
+            for (const auto& expected_user : expected_users) {
+                if (expected_user.empty() || expected_user == peer_->persistent->user_id)
+                    continue;
+                if (const auto generation = game->reserve_expected_user_with_generation(expected_user))
+                    owned_reservations_.emplace_back(game, std::make_pair(expected_user, *generation));
+            }
 
             // Build and send response
             ser::OperationResponseMessage resp{.operation_code = OpCodes::Matchmaking::JoinGame, .return_code = ErrorCodes::Core::Ok};
@@ -426,10 +540,16 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
 
             // Synchronize game, peer and token
             peer_->log->info("Joining {} game: {}", is_new ? "newly created" : "existing", game->id);
+            const std::string routed_game_id = game->id;
             peer_->persistent->invite(std::move(game), is_new);
             sync_persistent_peer(server_manager_, *peer_->persistent);
+            store_persistent_peer(server_manager_, std::move(peer_->persistent));
 
+            if (routed_game_id != game_id)
+                resp.parameters[DictKeyCodes::GameAndActor::GameId] = routed_game_id;
             send(proto_->Serialize(resp));
+            // Routed: reservation cleanup is now owned by the GameServer and TTLs.
+            owned_reservations_.clear();
 
             lco_return;
         }
@@ -461,6 +581,9 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                         const auto& app_games = app.get_games();
                         if (auto res = app_games.find(id); res != app_games.end()) {
                             if (auto game = res->second.lock()) {
+                                // Never select a GameServer placeholder that is not initialized yet.
+                                if (!game->is_joinable())
+                                    continue;
                                 // Make sure game is joinable
                                 if (game->validate_join(peer_->persistent->user_id).first == ErrorCodes::Core::Ok) {
                                     selected_game = game;
@@ -489,6 +612,10 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                     if (!game)
                         continue;
 
+                    // Never select a GameServer placeholder that is not initialized yet.
+                    if (!game->is_joinable())
+                        continue;
+
                     // Make sure game is joinable  TODO: Pass expected user count too
                     if (game->validate_join(peer_->persistent->user_id).first != ErrorCodes::Core::Ok)
                         continue;
@@ -508,13 +635,17 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                     case MatchmakingType::SerialMatching: {
                         // Prioritize games with fewer players
                         std::ranges::sort(candidates,
-                                          [](const std::shared_ptr<Game>& a, const std::shared_ptr<Game>& b) { return a->peers.size() < b->peers.size(); });
+                                          [](const std::shared_ptr<Game>& a, const std::shared_ptr<Game>& b) {
+                                              return a->get_config_snapshot().peer_count < b->get_config_snapshot().peer_count;
+                                          });
                         selected_game = candidates.front();
                     } break;
                     case MatchmakingType::FillRoom: {
                         // Prioritize games with more players
                         std::ranges::sort(candidates,
-                                          [](const std::shared_ptr<Game>& a, const std::shared_ptr<Game>& b) { return a->peers.size() > b->peers.size(); });
+                                          [](const std::shared_ptr<Game>& a, const std::shared_ptr<Game>& b) {
+                                              return a->get_config_snapshot().peer_count > b->get_config_snapshot().peer_count;
+                                          });
                         selected_game = candidates.front();
                     } break;
                     case MatchmakingType::RandomMatching: {
@@ -553,8 +684,9 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                 is_new = true;
             }
 
-            // Expect users  TODO: expect all given users
-            selected_game->expected_users.emplace(peer_->persistent->user_id);
+            // Expect user and remove the reservation after one reconnect window.
+            if (const auto generation = selected_game->reserve_expected_user_with_generation(peer_->persistent->user_id))
+                owned_reservations_.emplace_back(selected_game, std::make_pair(peer_->persistent->user_id, *generation));
 
             // Send Response
             ser::OperationResponseMessage resp;
@@ -569,10 +701,15 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
 
             // Synchronize game, peer and token
             peer_->log->info("Matchmaking success. Joining game: {}", selected_game->id);
+            const std::string matched_game_id = selected_game->id;
             peer_->persistent->invite(std::move(selected_game), is_new);
             sync_persistent_peer(server_manager_, *peer_->persistent);
+            store_persistent_peer(server_manager_, std::move(peer_->persistent));
 
+            resp.parameters[DictKeyCodes::GameAndActor::GameId] = matched_game_id;
             send(proto_->Serialize(resp));
+            // Routed: reservation cleanup is now owned by the GameServer and TTLs.
+            owned_reservations_.clear();
             lco_return;
         }
 
@@ -613,11 +750,12 @@ Awaitable<> MasterServerHandler::HandleOperationRequest(ser::OperationRequestMes
                         is_online = true;
                         if (auto expected_game = server_manager_.get_game(*peer_conn->persistent->app, peer_conn->persistent->get_invitation())) {
                             if (auto game = *expected_game) {
-                                if ((flags & FindFriendsOptions::CreatedOnGS) && !game->find_peer(peer_conn))
+                                const auto state = game->get_config_snapshot();
+                                if ((flags & FindFriendsOptions::CreatedOnGS) && !game->has_peer_actor(game->actor_id_for_peer(peer_conn).value_or(0)))
                                     break;
-                                if ((flags & FindFriendsOptions::Visible) && !game->is_visible)
+                                if ((flags & FindFriendsOptions::Visible) && !state.is_visible)
                                     break;
-                                if ((flags & FindFriendsOptions::Open) && !game->is_open)
+                                if ((flags & FindFriendsOptions::Open) && !state.is_open)
                                     break;
                                 room_id = game->id;
                             }
@@ -685,7 +823,12 @@ void MasterServerHandler::send_app_stats() {
         for (auto&& app : App::get_all(server_manager_))
             for (const auto& [lobby_name, weak_lobby] : app->get_lobbies())
                 if (auto lobby = weak_lobby.lock())
-                    fres += lobby->games.size();
+                    for (const auto& weak_game : lobby->games)
+                        if (auto game = weak_game.lock()) {
+                            const auto state = game->get_config_snapshot();
+                            if (state.is_created && state.is_visible)
+                                ++fres;
+                        }
         return fres;
     }();
     event.parameters[DictKeyCodes::LoadBalancing::PeerCount] = static_cast<int32_t>(server_manager_.get_connection_count<GameServerHandler>());
@@ -740,7 +883,8 @@ ser::HashtablePtr MasterServerHandler::get_game_list(Lobby& lobby, const Game& g
     ZoneScoped;
 
     auto fres = std::make_shared<ser::Hashtable>();
-    if (game.is_visible)
+    const auto state = game.get_config_snapshot();
+    if (state.is_created && state.is_visible)
         fres->emplace(game.id, std::make_shared<ser::Hashtable>(game.get_lobby_game_props()));
 
     return fres;
@@ -764,7 +908,7 @@ ser::HashtablePtr MasterServerHandler::get_game_list(Lobby& lobby, std::function
         auto game = weak_game.lock();
         if (!game)
             continue;
-        if (!game->is_visible)
+        if (!game->is_joinable())
             continue;
         if (game_filter && !game_filter(*game))
             continue;
@@ -786,10 +930,11 @@ ser::HashtablePtr MasterServerHandler::get_game_list(Lobby& lobby, std::function
     std::ranges::sort(sorted_games, [](const std::shared_ptr<Game>& a, const std::shared_ptr<Game>& b) {
         auto get_group = [](const Game& g) {
             // First group: open and not full (joinable).
-            if (g.is_open && g.peers.size() < g.max_peers)
+            const auto state = g.get_config_snapshot();
+            if (state.is_open && (state.max_peers == 0 || state.peer_count < state.max_peers))
                 return 0;
             // Third group: closed (not joinable, could be full or not)
-            if (!g.is_open)
+            if (!state.is_open)
                 return 2;
             // Second group: full but not closed (not joinable)
             return 1;

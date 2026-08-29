@@ -13,6 +13,7 @@
 #include "server_manager.hpp"
 
 #include <algorithm>
+#include <mutex>
 #include <ranges>
 #include <luxon/ser_interface.hpp>
 #include <luxon/common_codes.hpp>
@@ -47,72 +48,153 @@ using ChangeInterestGroups = Model<Parameter<ser::ByteArray, RoutingAndEvents::A
 } // namespace models
 
 void GameServerHandler::HandleSlowUpdate() {
+    std::unique_lock operation_lock(operation_mutex_);
+    if (pending_authentication_) {
+        if (const auto token = pending_authentication_->request.parameters[DictKeyCodes::LoadBalancing::Token].get_ptr<std::string>();
+            token && server_manager_.has_persistent_peer(*token)) {
+            auto pending_authentication = std::move(*pending_authentication_);
+            pending_authentication_.reset();
+            operation_lock.unlock();
+            HandleOperationRequest(std::move(pending_authentication.request), pending_authentication.is_encrypted,
+                                   pending_authentication.command_header)_lco_detached;
+            return;
+        }
+
+        if (pending_authentication_->wait_started.get() >= 2000) {
+            const ser::OperationResponseMessage resp{.operation_code = pending_authentication_->request.operation_code,
+                                                     .return_code = ErrorCodes::Auth::AuthenticationTokenExpired,
+                                                     .debug_message = "Authentication failure: Got no persistent peer data"};
+            send(proto_->Serialize(resp, pending_authentication_->is_encrypted));
+            peer_->disconnect();
+            pending_authentication_.reset();
+            return;
+        }
+    }
+
     if (pending_join_) {
-        if (!current_game_ || !current_game_->is_creating.load(std::memory_order_acquire)) {
+        const auto pending_game = pending_join_->game;
+        const bool generation_changed = pending_game && pending_join_->creation_generation != 0 &&
+                                        pending_game->active_creation_generation() != pending_join_->creation_generation;
+        const bool creation_finished = pending_game &&
+                                       pending_game->is_created.load(std::memory_order_acquire) &&
+                                       !pending_game->is_creating.load(std::memory_order_acquire) &&
+                                       !generation_changed;
+        const bool creation_aborted = pending_game &&
+                                      !pending_game->is_created.load(std::memory_order_acquire) &&
+                                      !pending_game->is_creating.load(std::memory_order_acquire);
+        if (creation_finished) {
             auto pending_join = std::move(*pending_join_);
             pending_join_.reset();
+            current_game_ = pending_join.game;
+            operation_lock.unlock();
             HandleOperationRequest(std::move(pending_join.request), pending_join.is_encrypted,
                                    pending_join.command_header)_lco_detached;
             return;
         }
 
-        if (pending_join_->wait_started.get() >= 5000) {
+        if (!pending_game || creation_aborted || generation_changed || pending_join_->wait_started.get() >= 5000) {
             const ser::OperationResponseMessage resp{
                 .operation_code = pending_join_->request.operation_code,
                 .return_code = ErrorCodes::Matchmaking::GameIdNotExists,
-                .debug_message = "Game creation timed out"};
+                .debug_message = creation_aborted ? "Game creation was aborted" :
+                                 (generation_changed ? "Game creation attempt expired" :
+                                  (pending_game ? "Game creation timed out" : "Game no longer exists"))};
             send(proto_->Serialize(resp, pending_join_->is_encrypted),
                  enet::EnetSendOptions{.channel = pending_join_->command_header.channel_id});
             pending_join_.reset();
         }
     }
 
+    operation_lock.unlock();
     HandlerBase::HandleSlowUpdate();
 }
 
 Awaitable<> GameServerHandler::HandleDisconnect() {
     ZoneScoped;
 
+    std::unique_lock operation_lock(operation_mutex_);
+    disconnected_.store(true, std::memory_order_release);
     pending_join_.reset();
+    pending_authentication_.reset();
 
-    if (auto& game = current_game_) {
-        if (game_peer_) {
+    // Move ownership into a local so the handler state is consistent while
+    // plugins await, and the Game stays alive until cleanup finishes.
+    if (auto game = std::move(current_game_)) {
+        if (const auto creating_game = creation_game_.lock();
+            creating_game && creation_generation_ != 0) {
+            const bool aborted = creating_game->abort_creation_transaction(peer_,
+                                                                           creation_generation_);
+            creation_game_.reset();
+            creation_generation_ = 0;
+            pending_join_.reset();
+            game_peer_ = nullptr;
+            if (aborted)
+                creating_game->trigger_lobby_update();
+        }
 
-            // Cleanup cache if enabled
-            if (game->flags & DictKeyCodes::RoutingAndEvents::CleanupCacheOnLeave)
-                game->event_cache.remove_if([&](const Event& cached_event) { return cached_event.sender_actor_id == game_peer_->actor_id; });
+        if (const auto snapshot = game->get_config_snapshot(); snapshot.peer_count != 0) {
+            const int32_t actor_id = game->actor_id_for_peer(peer_).value_or(0);
+            if (actor_id != 0 && game->has_peer_actor(actor_id)) {
+                // Plugins receive an address-stable node: removed peers are
+                // spliced into retired_peers instead of erased by remove_peer().
+                GamePeer *leaving_peer = nullptr;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    leaving_peer = game->find_peer(actor_id);
+                }
 
-            if (!has_left_) {
-                // Call into plugins
-                GAME_PLUGINS_INVOKE({
-                    OnLeaveGameCallInfo info{.leaver = game_peer_};
-                    ser::OperationRequestMessage req{.operation_code = OpCodes::Lite::Leave};
-                    lco_await game->execute_plugin_chain(&PluginBase::OnLeave, req, info);
-                });
-            }
+                // Cleanup cache if enabled
+                if (snapshot.flags & DictKeyCodes::RoutingAndEvents::CleanupCacheOnLeave) {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    game->event_cache.remove_if([actor_id](const Event& cached_event) {
+                        return cached_event.sender_actor_id == actor_id;
+                    });
+                }
 
-            // Remove peer
-            peer_->log->info("Removing peer from game...");
-            const int32_t actor_id = game_peer_ ? game_peer_->actor_id : 0;
-            const bool was_master = actor_id == game->master_actor;
-            if (!game->remove_peer(peer_))
-                peer_->log->warn("Failed to remove peer from game");
+                if (!has_left_) {
+                    // Call into plugins
+                    GAME_PLUGINS_INVOKE({
+                        OnLeaveGameCallInfo info{.leaver = leaving_peer};
+                        ser::OperationRequestMessage req{.operation_code = OpCodes::Lite::Leave};
+                        lco_await game->execute_plugin_chain(&PluginBase::OnLeave, req, info);
+                    });
+                }
 
-            // Broadcast leave event
-            if (!(game->flags & GameFlags::SuppressRoomEvents)) {
-                std::vector<int32_t> actor_ids;
-                for (auto& game_peer : game->peers)
-                    actor_ids.push_back(game_peer.actor_id);
+                // Remove peer
+                peer_->log->info("Removing peer from game...");
+                const bool was_master = actor_id == snapshot.master_actor;
+                bool removed_peer = false;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    removed_peer = game->remove_peer(peer_);
+                }
+                if (!removed_peer)
+                    peer_->log->warn("Failed to remove peer from game");
+                game_peer_ = nullptr;
+                game->trigger_lobby_update();
 
-                Event event{.code = EventCodes::Leave, .sender_actor_id = actor_id, .receivers = ReceiverGroup::All};
-                event.top_params[DictKeyCodes::GameAndActor::ActorNo] = actor_id;
-                event.top_params[DictKeyCodes::GameAndActor::ActorList] = &actor_ids;
-                if (was_master)
-                    event.top_params[DictKeyCodes::MetadataAndMisc::MasterClientId] = game->master_actor;
-                current_game_->broadcast_event(event);
+                // Broadcast leave event
+                if (!(game->get_config_snapshot().flags & GameFlags::SuppressRoomEvents)) {
+                    std::vector<int32_t> actor_ids;
+                    {
+                        std::lock_guard admission_lock(game->admission_mutex);
+                        for (auto& game_peer : game->peers)
+                            actor_ids.push_back(game_peer.actor_id);
+                    }
+
+                    Event event{.code = EventCodes::Leave, .sender_actor_id = actor_id, .receivers = ReceiverGroup::All};
+                    event.top_params[DictKeyCodes::GameAndActor::ActorNo] = actor_id;
+                    event.top_params[DictKeyCodes::GameAndActor::ActorList] = &actor_ids;
+                    if (was_master)
+                        event.top_params[DictKeyCodes::MetadataAndMisc::MasterClientId] = game->get_config_snapshot().master_actor;
+                    game->broadcast_event(event);
+                }
             }
         }
 
+        creation_game_.reset();
+        creation_generation_ = 0;
+        game_peer_ = nullptr;
         game.reset();
     }
 
@@ -122,18 +204,13 @@ Awaitable<> GameServerHandler::HandleDisconnect() {
 Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessage&& req, bool is_encrypted, const enet::EnetCommandHeader& cmd_header) {
     ZoneScoped;
 
-    const auto ensure_is_master = [&]() {
-        const bool is_master = game_peer_ && game_peer_->actor_id == current_game_->master_actor || current_game_->peers.size() == 0;
-        if (!is_master) {
-            const ser::OperationResponseMessage resp{
-                .operation_code = req.operation_code, .return_code = ErrorCodes::Core::OperationNotAllowedInCurrentState, .debug_message = "Must be master"};
-            send(proto_->Serialize(resp), enet::EnetSendOptions{cmd_header.channel_id});
-            return false;
-        }
-        return true;
-    };
+    std::unique_lock operation_lock(operation_mutex_);
+
     const auto ensure_joined_state = [&](bool joined = true) {
-        if ((game_peer_ && game_peer_->actor_id != 0) != joined) {
+        bool has_joined_peer = false;
+        if (current_game_)
+            has_joined_peer = current_game_->actor_id_for_peer(peer_).has_value();
+        if (has_joined_peer != joined) {
             const ser::OperationResponseMessage resp{
                 .operation_code = req.operation_code, .return_code = ErrorCodes::Core::OperationNotAllowedInCurrentState, .debug_message = "Must join first"};
             send(proto_->Serialize(resp), enet::EnetSendOptions{cmd_header.channel_id});
@@ -151,6 +228,20 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
         case OpCodes::Auth::Authenticate:
         case OpCodes::Auth::AuthenticateOnce: {
             ZoneScopedN("HandleOperationRequest_Authenticate");
+
+            if (const auto token = req.parameters[DictKeyCodes::LoadBalancing::Token].get_ptr<std::string>(); token && !server_manager_.has_persistent_peer(*token)) {
+                if (pending_authentication_) {
+                    const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
+                                                             .return_code = ErrorCodes::Core::OperationNotAllowedInCurrentState,
+                                                             .debug_message = "Authentication already pending"};
+                    send(proto_->Serialize(resp, is_encrypted), enet::EnetSendOptions{.channel = cmd_header.channel_id});
+                    lco_return;
+                }
+                pending_authentication_.emplace(PendingAuthentication{.request = std::move(req),
+                                                                       .is_encrypted = is_encrypted,
+                                                                       .command_header = cmd_header});
+                lco_return;
+            }
 
             // Try to authenticate
             auto resp = lco_await authenticate(server_manager_, *peer_, req, cmd_header, false);
@@ -171,8 +262,8 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             // Set current game
             auto& pp = *peer_->persistent;
             auto expected_game = server_manager_.get_game(pp.get_invitation());
-            pp.reset_game(); // Effectively expire peer's game invitation and memory ownership
             if (expected_game) {
+                pp.reset_owned_game_if_created();
                 if (server_manager_.is_game_external(**expected_game)) {
                     peer_->log->error("Peer tried to join an external game! Forcing disconnect.");
                     const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
@@ -185,6 +276,7 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                     current_game_ = std::move(*expected_game);
                 }
             } else {
+                pp.reset_game();
                 peer_->log->error("Persistent peer doesn't have valid game assigned! Forcing disconnect.");
                 const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
                                                          .return_code = ErrorCodes::Matchmaking::ServerForbidden,
@@ -216,9 +308,14 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
 
             const auto cache_op = params->get<Cache>();
 
-            // Build event
+            // Build event from a stable actor identity. The list node is not an
+            // ownership handle and must not be dereferenced after an await.
+            const int32_t sender_actor_id = game->actor_id_for_peer(peer_).value_or(0);
+            if (sender_actor_id == 0) {
+                lco_return;
+            }
             Event event;
-            event.sender_actor_id = game_peer_->actor_id;
+            event.sender_actor_id = sender_actor_id;
             event.code = params->get<Code>();
             if (auto it = req.parameters.find(Data); it != req.parameters.end())
                 event.data = std::move(it->second);
@@ -232,7 +329,15 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
 
             // Call into plugins
             GAME_PLUGINS_INVOKE({
-                OnRaiseEventCallInfo info{.raiser = game_peer_, .event = event, .cache_op = cache_op};
+                GamePeer *raiser = nullptr;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    raiser = game->find_peer(sender_actor_id);
+                }
+                if (!raiser) {
+                    lco_return;
+                }
+                OnRaiseEventCallInfo info{.raiser = raiser, .event = event, .cache_op = cache_op};
                 const Result res = lco_await game->execute_plugin_chain(&PluginBase::OnRaiseEvent, req, info);
 
                 if (res == Result::Cancel)
@@ -269,6 +374,7 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 // Event code 0 is wildcard
                 const bool wildcard_code = event.code == 0;
 
+                std::lock_guard admission_lock(game->admission_mutex);
                 game->event_cache.remove_if([&](const Event& cached_event) {
                     // Code Filter
                     if (!wildcard_code && cached_event.code != event.code)
@@ -299,6 +405,7 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
 
             // RemoveFromCacheForActorsLeft
             if (cache_op == CacheOperation::RemoveFromCacheForActorsLeft) {
+                std::lock_guard admission_lock(game->admission_mutex);
                 game->event_cache.remove_if([&](const Event& cached_event) {
                     return game->find_peer(cached_event.sender_actor_id) == nullptr && cached_event.sender_actor_id != 0; // Don't remove global
                 });
@@ -316,6 +423,7 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 if (cache_op == CacheOperation::AddToRoomCacheGlobal)
                     cached_copy.sender_actor_id = 0; // Can not be traced back
 
+                std::lock_guard admission_lock(game->admission_mutex);
                 game->event_cache.emplace_back(std::move(cached_copy));
             }
 
@@ -355,7 +463,7 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 lco_return;
             }
 
-            // A creator may still be running before is_created is published. Queue
+            // A creator may still be running before the room is ready. Queue
             // every other request first so ordinary JoinGame is not rejected during
             // that window.
             const bool creation_in_progress = game->is_creating.load(std::memory_order_acquire);
@@ -369,47 +477,126 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 }
 
                 peer_->log->debug("Room is being initialized, retaining join request for later processing");
-                pending_join_.emplace(PendingJoin{.request = std::move(req),
+                pending_join_.emplace(PendingJoin{.game = game,
+                                                  .creation_generation = game->active_creation_generation(),
+                                                  .request = std::move(req),
                                                   .is_encrypted = is_encrypted,
                                                   .command_header = cmd_header});
                 lco_return;
             }
 
-            // Claim creation before any await. Other handlers keep their complete
-            // request and retry the same path after initialization finishes.
-            const bool is_master = game->try_begin_creation();
-
-            if (!is_master && !game->is_created && !game->is_creating.load(std::memory_order_acquire)) {
+            // A normal JoinGame may never claim an uninitialized placeholder.
+            // Only CreateGame or JoinGame(CreateIfNotExists=1) may initialize it.
+            if (!game->is_created.load(std::memory_order_acquire) && !can_create) {
                 const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
                                                          .return_code = ErrorCodes::Matchmaking::GameIdNotExists,
                                                          .debug_message = "Game does not exist"};
-                send(proto_->Serialize(resp, is_encrypted), enet::EnetSendOptions{.channel = cmd_header.channel_id});
+                send(proto_->Serialize(resp, is_encrypted),
+                     enet::EnetSendOptions{.channel = cmd_header.channel_id});
                 lco_return;
             }
 
-            auto reset_creating = [&]() {
-                if (is_master) {
-                    game->finish_creation();
-                    peer_->log->info("Room initialization complete, is_creating=false");
+            // Claim creation before any await. Other handlers keep their complete
+            // request and retry the same path after initialization finishes.
+            const auto creation_owner = peer_;
+            const uint64_t creation_generation = game->try_begin_creation(creation_owner);
+            const bool is_master = creation_generation != 0;
+            if (is_master) {
+                creation_generation_ = creation_generation;
+                creation_game_ = game;
+            }
+            if (!is_master && !game->is_created.load(std::memory_order_acquire)) {
+                if (game->is_creating.load(std::memory_order_acquire)) {
+                    if (pending_join_) {
+                        const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
+                                                                 .return_code = ErrorCodes::Core::OperationNotAllowedInCurrentState,
+                                                                 .debug_message = "Join already pending"};
+                        send(proto_->Serialize(resp, is_encrypted),
+                             enet::EnetSendOptions{.channel = cmd_header.channel_id});
+                        lco_return;
+                    }
+                    pending_join_.emplace(PendingJoin{.game = game,
+                                                      .creation_generation = game->active_creation_generation(),
+                                                      .request = std::move(req),
+                                                      .is_encrypted = is_encrypted,
+                                                      .command_header = cmd_header});
+                    lco_return;
                 }
+
+                const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
+                                                         .return_code = ErrorCodes::Matchmaking::GameIdNotExists,
+                                                         .debug_message = can_create ? "Game creation was not completed" : "Game does not exist"};
+                send(proto_->Serialize(resp, is_encrypted),
+                     enet::EnetSendOptions{.channel = cmd_header.channel_id});
+                lco_return;
+            }
+
+            bool creation_aborted = false;
+            bool creation_committed = false;
+            const uint64_t request_generation = creation_generation;
+            std::vector<std::pair<std::string, uint64_t>> added_expected_users;
+            const auto rollback_expected_users = [&]() {
+                for (const auto& [expected_user, generation] : added_expected_users)
+                    game->remove_expected_user_if_generation(expected_user, generation);
+                added_expected_users.clear();
             };
-            auto ensure_reset = std::shared_ptr<void>(nullptr, [reset_creating](void*) { reset_creating(); });
+            const auto rollback_join = [&]() -> void {
+                // A committed join is owned by normal disconnect cleanup; never
+                // erase its peer through the pre-commit rollback path.
+                if (creation_committed || creation_aborted)
+                    return;
+
+                if (is_master) {
+                    const bool aborted = game->abort_creation_transaction(creation_owner,
+                                                                           request_generation);
+                    creation_aborted = true;
+                    game_peer_ = nullptr;
+                    creation_game_.reset();
+                    creation_generation_ = 0;
+                    if (aborted)
+                        game->trigger_lobby_update();
+                    return;
+                }
+
+                creation_aborted = true;
+                if (game_peer_)
+                    game->remove_peer(peer_);
+                game_peer_ = nullptr;
+                rollback_expected_users();
+            };
+            auto ensure_reset = std::shared_ptr<void>(nullptr, [&](void*) {
+                if (!creation_committed && !creation_aborted)
+                    rollback_join();
+            });
+
+            if (disconnected_.load(std::memory_order_acquire)) {
+                rollback_join();
+                lco_return;
+            }
 
             if (is_master) {
 #ifdef LUXON_SERVER_ENABLE_PLUGINS
-                if (current_game_->plugins.empty())
+                if (game->plugins.empty())
 #endif
                 {
                     // Load given plugins if creating room
                     for (const std::string& plugin_name : params->get<DictKeyCodes::RpcAndPlugins::Plugins>()) {
 #ifdef LUXON_SERVER_ENABLE_PLUGINS
-                        auto plugin = game_plugins::registry::instantiate(current_game_.get(), plugin_name);
+                        if (disconnected_.load(std::memory_order_acquire)) {
+                            rollback_join();
+                            lco_return;
+                        }
+                        auto plugin = game_plugins::registry::instantiate(game.get(), plugin_name);
                         if (!plugin) {
                             peer_->log->warn("Attempting to load unknown game plugin: {}", plugin_name);
                             continue;
                         }
 
-                        lco_await current_game_->plugins.emplace_back(std::move(plugin))->OnAttach();
+                        lco_await game->plugins.emplace_back(std::move(plugin))->OnAttach();
+                        if (disconnected_.load(std::memory_order_acquire)) {
+                            rollback_join();
+                            lco_return;
+                        }
 #else
                 peer_->log->warn("Attempting to load game plugin when plugins are disabled: {}", plugin_name);
 #endif
@@ -429,10 +616,13 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
 
             // Call into plugins
             GAME_PLUGINS_INVOKE({
-                auto& game = current_game_;
+                if (disconnected_.load(std::memory_order_acquire)) {
+                    rollback_join();
+                    lco_return;
+                }
                 Result res;
 
-                if (!game->is_created) {
+                if (!game->is_created.load(std::memory_order_acquire)) {
                     OnCreateGameCallInfo info{.creator = peer_,
                                               .is_join = req.operation_code == OpCodes::Matchmaking::JoinGame,
                                               .create_if_not_exist = static_cast<bool>(params->get<DictKeyCodes::AuthAndLobby::CreateIfNotExists>())};
@@ -442,49 +632,85 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                     res = lco_await game->execute_plugin_chain(&PluginBase::BeforeJoin, req, info);
                 }
 
-                if (res == Result::Fail) {
-                    if (is_master) {
-                        game->is_created = false;
-                        game->finish_creation();
-                    }
-                    const ser::OperationResponseMessage resp{.operation_code = req.operation_code, .return_code = ErrorCodes::Matchmaking::PluginReportedError};
+                if (disconnected_.load(std::memory_order_acquire)) {
+                    rollback_join();
+                    lco_return;
+                }
+
+                if (res != Result::Continue) {
+                    rollback_join();
+                    const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
+                                                             .return_code = res == Result::Cancel
+                                                                                ? ErrorCodes::Core::OperationNotAllowedInCurrentState
+                                                                                : ErrorCodes::Matchmaking::PluginReportedError};
                     send(proto_->Serialize(resp, is_encrypted), enet::EnetSendOptions{.channel = cmd_header.channel_id});
                     lco_return;
                 }
             });
 
             if (is_master) {
-                // Apply game settings before publishing the room as created.
-                if (auto player_ttl = params->get<DictKeyCodes::GameSettings::PlayerTTL>())
-                    game->player_ttl = *player_ttl;
-                if (auto empty_room_ttl = params->get<DictKeyCodes::GameSettings::EmptyRoomTTL>())
-                    game->empty_game_ttl = *empty_room_ttl;
+                // Apply game settings before validating capacity. MaxPlayers must
+                // participate in the first join's admission decision. Keep the
+                // lease check and mutations in one admission critical section so
+                // disconnect cannot interleave a stale creation attempt.
+                bool settings_applied = false;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    if (game->is_creation_active(creation_owner, request_generation)) {
+                        if (auto player_ttl = params->get<DictKeyCodes::GameSettings::PlayerTTL>())
+                            game->player_ttl = *player_ttl;
+                        if (auto empty_room_ttl = params->get<DictKeyCodes::GameSettings::EmptyRoomTTL>())
+                            game->empty_game_ttl = *empty_room_ttl;
 
-                if (auto flags = params->get<DictKeyCodes::GameSettings::GameFlags>())
-                    game->flags = *flags;
+                        if (auto flags = params->get<DictKeyCodes::GameSettings::GameFlags>())
+                            game->flags = *flags;
 
-                auto set_flag = [&](int32_t flag, std::optional<bool> value) {
-                    if (!value)
-                        return;
-                    if (*value)
-                        game->flags |= flag;
-                    else
-                        game->flags &= ~flag;
-                };
+                        auto set_flag = [&](int32_t flag, std::optional<bool> value) {
+                            if (!value)
+                                return;
+                            if (*value)
+                                game->flags |= flag;
+                            else
+                                game->flags &= ~flag;
+                        };
 
-                set_flag(GameFlags::CheckUserOnJoin, params->get<DictKeyCodes::GameSettings::CheckUserOnJoin>());
-                set_flag(GameFlags::SuppressRoomEvents, params->get<DictKeyCodes::RoutingAndEvents::SuppressRoomEvents>());
-                set_flag(GameFlags::PublishUserId, params->get<DictKeyCodes::RoutingAndEvents::PublishUserId>());
-                game->is_created = true;
+                        set_flag(GameFlags::CheckUserOnJoin, params->get<DictKeyCodes::GameSettings::CheckUserOnJoin>());
+                        set_flag(GameFlags::SuppressRoomEvents, params->get<DictKeyCodes::RoutingAndEvents::SuppressRoomEvents>());
+                        set_flag(GameFlags::PublishUserId, params->get<DictKeyCodes::RoutingAndEvents::PublishUserId>());
+
+                        if (const auto& game_props = params->get<DictKeyCodes::Properties::GameProperties>())
+                            if (const auto max_players = game_props->find(GameProps::MaxPlayers); max_players != game_props->end())
+                                max_players->second.store_if<uint8_t>(game->max_peers);
+                        ++game->state_revision_;
+                        settings_applied = true;
+                    }
+                }
+                if (!settings_applied) {
+                    rollback_join();
+                    lco_return;
+                }
+            }
+
+            if (disconnected_.load(std::memory_order_acquire) ||
+                (is_master && !game->is_creation_active(creation_owner, request_generation))) {
+                rollback_join();
+                lco_return;
             }
 
             const auto& expected_users = params->get<GameProps::ExpectedUsers>();
-            const auto [expected_users_code, expected_users_message] = game->validate_join(peer_->persistent->user_id, expected_users.size());
+            std::unique_lock admission_lock(game->admission_mutex);
+            if (is_master && !game->is_creation_active(creation_owner, request_generation)) {
+                admission_lock.unlock();
+                rollback_join();
+                lco_return;
+            }
+            const auto [expected_users_code, expected_users_message] =
+                game->validate_join(peer_->persistent->user_id,
+                                    expected_users, is_master);
             if (expected_users_code != ErrorCodes::Core::Ok) {
-                if (is_master) {
-                    game->is_created = false;
-                    game->finish_creation();
-                }
+                admission_lock.unlock();
+                rollback_join();
+                peer_->disconnect();
                 const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
                                                          .return_code = expected_users_code,
                                                          .debug_message = std::string(expected_users_message)};
@@ -493,19 +719,21 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             }
 
             for (const auto& expected_user : expected_users) {
-                if (!game->expected_users.emplace(expected_user).second)
+                if (expected_user.empty() || expected_user == peer_->persistent->user_id ||
+                    game->find_peer(peer_))
                     continue;
-                server_manager_.add_scheduled_task(30000, [game, expected_user]() { game->expected_users.erase(expected_user); });
+                if (const auto reservation_generation = game->reserve_expected_user_with_generation(expected_user))
+                    added_expected_users.emplace_back(expected_user, *reservation_generation);
             }
 
-            // Create peer for game
-            auto game_peer = current_game_->create_peer(peer_);
+            // Create peer for game. Keep the local shared pointer stable across
+            // plugin awaits and disconnect callbacks.
+            auto game_peer = game->create_peer(peer_);
             if (!game_peer.is_valid()) {
                 peer_->log->error("Game peer could not be created. Connection must terminate now.");
-                if (is_master) {
-                    game->is_created = false;
-                    game->finish_creation();
-                }
+                admission_lock.unlock();
+                rollback_join();
+                peer_->disconnect();
                 const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
                                                          .return_code = ErrorCodes::Matchmaking::GameFull,
                                                          .debug_message = "Unable to allocate an actor"};
@@ -514,13 +742,20 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             }
 
             // Add peer to game
-            game_peer_ = game->add_peer(std::move(game_peer));
+            if (disconnected_.load(std::memory_order_acquire) ||
+                (is_master && !game->is_creation_active(creation_owner, request_generation))) {
+                admission_lock.unlock();
+                rollback_join();
+                lco_return;
+            }
+            game_peer_ = is_master
+                              ? game->add_peer_for_creation(std::move(game_peer), creation_owner, request_generation)
+                              : game->add_peer(std::move(game_peer));
             if (!game_peer_) {
                 peer_->log->error("Player could not be added to game. Connection must terminate now.");
-                if (is_master) {
-                    game->is_created = false;
-                    game->finish_creation();
-                }
+                admission_lock.unlock();
+                rollback_join();
+                peer_->disconnect();
                 const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
                                                          .return_code = ErrorCodes::Matchmaking::GameFull,
                                                          .debug_message = "Unable to add player to game"};
@@ -528,74 +763,183 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 lco_return;
             }
             peer_->log->info("Successfully joined game: {}", game->id);
+            admission_lock.unlock();
+            game->trigger_lobby_update();
 
             // Call into plugins
             bool broadcast_actor_props = true;
             GAME_PLUGINS_INVOKE({
-                OnJoinGameCallInfo info{.joiner = game_peer_};
+                if (disconnected_.load(std::memory_order_acquire)) {
+                    rollback_join();
+                    lco_return;
+                }
+                int32_t joined_actor_id = 0;
+                GamePeer *joiner = nullptr;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    joiner = game->find_peer(peer_);
+                    if (joiner)
+                        joined_actor_id = joiner->actor_id;
+                }
+                if (!joiner) {
+                    rollback_join();
+                    lco_return;
+                }
+                OnJoinGameCallInfo info{.joiner = joiner};
                 const Result res = lco_await game->execute_plugin_chain(&PluginBase::OnJoinGame, req, info);
+                if (disconnected_.load(std::memory_order_acquire)) {
+                    rollback_join();
+                    lco_return;
+                }
+                // The list node pointer handed to the plugin may have been
+                // retired while awaiting; re-resolve through the actor id.
+                const auto current_actor = game->actor_id_for_peer(peer_);
+                game_peer_ = current_actor && *current_actor == joined_actor_id
+                                 ? game->find_peer(joined_actor_id)
+                                 : nullptr;
+                if (!game_peer_) {
+                    rollback_join();
+                    if (is_master)
+                        peer_->disconnect();
+                    lco_return;
+                }
 
-                if (res == Result::Fail) {
+                if (res != Result::Continue) {
                     peer_->log->info("Reverting join: {}", game->id);
-                    game->remove_peer(peer_);
+                    bool removed_peer = false;
+                    if (!is_master) {
+                        std::lock_guard admission_lock(game->admission_mutex);
+                        removed_peer = game->remove_peer(peer_);
+                    }
+                    if (removed_peer)
+                        game->trigger_lobby_update();
                     game_peer_ = nullptr;
+                    rollback_join();
+                    if (is_master)
+                        peer_->disconnect();
 
-                    const ser::OperationResponseMessage resp{.operation_code = req.operation_code, .return_code = ErrorCodes::Matchmaking::PluginReportedError};
+                    const ser::OperationResponseMessage resp{.operation_code = req.operation_code,
+                                                             .return_code = res == Result::Cancel
+                                                                                ? ErrorCodes::Core::OperationNotAllowedInCurrentState
+                                                                                : ErrorCodes::Matchmaking::PluginReportedError};
                     send(proto_->Serialize(resp, is_encrypted), enet::EnetSendOptions{.channel = cmd_header.channel_id});
                     lco_return;
                 }
 
-                if (!info.publish_user_id.value_or(true))
-                    game_peer_->actor_props.erase(ActorProps::UserId);
+                if (!info.publish_user_id.value_or(true)) {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    if (auto *current_peer = game->find_peer(joined_actor_id))
+                        current_peer->actor_props.erase(ActorProps::UserId);
+                }
 
                 broadcast_actor_props = info.broadcast_actor_props.value_or(true);
             });
 
             // Update properties - CRITICAL FIX: Insert properties BEFORE capturing actor props snapshot
-            if (const auto& actor_props = params->get<DictKeyCodes::Properties::ActorProperties>())
-                game->insert_actor_props(game_peer_->actor_id, *actor_props);
-            if (is_master)
-                if (const auto& game_props = params->get<DictKeyCodes::Properties::GameProperties>())
-                    game->insert_game_props(*game_props);
-
-            if (is_master)
-                game->trigger_lobby_update();
+            if (disconnected_.load(std::memory_order_acquire) ||
+                (is_master && !game->is_creation_active(creation_owner, request_generation))) {
+                rollback_join();
+                lco_return;
+            }
+            int32_t joined_actor_id = 0;
+            {
+                std::lock_guard admission_lock(game->admission_mutex);
+                if (const auto *current_peer = game->find_peer(peer_))
+                    joined_actor_id = current_peer->actor_id;
+                if (joined_actor_id == 0) {
+                    rollback_join();
+                    lco_return;
+                }
+                if (const auto& actor_props = params->get<DictKeyCodes::Properties::ActorProperties>())
+                    game->insert_actor_props(joined_actor_id, *actor_props);
+                if (is_master)
+                    if (const auto& game_props = params->get<DictKeyCodes::Properties::GameProperties>())
+                        game->insert_game_props(*game_props);
+            }
+            if (disconnected_.load(std::memory_order_acquire) ||
+                (is_master && !game->is_creation_active(creation_owner, request_generation)) ||
+                joined_actor_id == 0) {
+                rollback_join();
+                lco_return;
+            }
 
             // CRITICAL FIX: Capture actor props AFTER inserting this player's properties
             // This ensures all other players receive the complete property list including the new player
-            auto all_actor_props = game->get_actor_props();
+            ser::Hashtable all_actor_props;
+            {
+                std::lock_guard admission_lock(game->admission_mutex);
+                all_actor_props = game->get_actor_props();
+            }
+
+            if (is_master) {
+                if (disconnected_.load(std::memory_order_acquire) ||
+                    !game->commit_creation(creation_owner,
+                                           creation_generation)) {
+                    rollback_join();
+                    lco_return;
+                }
+                creation_committed = true;
+                creation_game_.reset();
+                creation_generation_ = 0;
+                game->trigger_lobby_update();
+            } else {
+                creation_committed = true;
+            }
+
+            if (disconnected_.load(std::memory_order_acquire) || !game_peer_) {
+                rollback_join();
+                lco_return;
+            }
 
             // Construct response
+            if (joined_actor_id == 0) {
+                rollback_join();
+                lco_return;
+            }
             ser::OperationResponseMessage resp;
             resp.operation_code = req.operation_code;
             resp.return_code = ErrorCodes::Core::Ok;
 
+            const auto post_commit_state = game->get_config_snapshot();
             std::vector<int32_t> actor_ids;
-            for (auto& game_peer : game->peers)
-                actor_ids.push_back(game_peer.actor_id);
+            ser::Hashtable game_props;
+            int32_t actor_no = 0;
+            ser::Hashtable joined_actor_props;
+            {
+                std::lock_guard admission_lock(game->admission_mutex);
+                for (auto& game_peer : game->peers)
+                    actor_ids.push_back(game_peer.actor_id);
+                if (const auto *current_peer = game->find_peer(joined_actor_id)) {
+                    actor_no = current_peer->actor_id;
+                    joined_actor_props = current_peer->actor_props;
+                }
+                game_props = game->get_game_props();
+            }
 
-            resp.parameters[DictKeyCodes::GameSettings::GameFlags] = static_cast<int32_t>(game->flags);
+            resp.parameters[DictKeyCodes::GameSettings::GameFlags] = static_cast<int32_t>(post_commit_state.flags);
             resp.parameters[DictKeyCodes::GameAndActor::ActorList] = &actor_ids;
-            resp.parameters[DictKeyCodes::Properties::GameProperties] = game->get_game_props();
-            resp.parameters[DictKeyCodes::GameAndActor::ActorNo] = game_peer_->actor_id;
+            resp.parameters[DictKeyCodes::Properties::GameProperties] = std::move(game_props);
+            resp.parameters[DictKeyCodes::GameAndActor::ActorNo] = actor_no;
             if (broadcast_actor_props)
                 resp.parameters[DictKeyCodes::Properties::ActorProperties] = &all_actor_props;
 
             send(proto_->Serialize(resp, is_encrypted), enet::EnetSendOptions{.channel = cmd_header.channel_id});
 
             // Broadcast Join Event
-            if (!(game->flags & GameFlags::SuppressRoomEvents)) {
-                Event event{.code = EventCodes::Join, .sender_actor_id = game_peer_->actor_id, .receivers = ReceiverGroup::All};
+            if (!disconnected_.load(std::memory_order_acquire) && actor_no != 0 &&
+                !(post_commit_state.flags & GameFlags::SuppressRoomEvents)) {
+                Event event{.code = EventCodes::Join, .sender_actor_id = actor_no, .receivers = ReceiverGroup::All};
                 event.top_params[DictKeyCodes::GameAndActor::ActorList] = &actor_ids;
-                event.top_params[DictKeyCodes::GameAndActor::ActorNo] = game_peer_->actor_id;
-                if (broadcast_actor_props && !(game->flags & GameFlags::SuppressPlayerInfo))
-                    event.top_params[DictKeyCodes::Properties::ActorProperties] = &game_peer_->actor_props;
+                event.top_params[DictKeyCodes::GameAndActor::ActorNo] = actor_no;
+                if (broadcast_actor_props && !(post_commit_state.flags & GameFlags::SuppressPlayerInfo))
+                    event.top_params[DictKeyCodes::Properties::ActorProperties] = std::move(joined_actor_props);
 
                 game->broadcast_event(event);
             }
 
-            // Flood the client with current state
-            game->flood_peer(game_peer_);
+            // Flood the client with current state using a stable actor identity.
+            if (!disconnected_.load(std::memory_order_acquire) && actor_no != 0)
+                game->flood_peer_by_actor(actor_no);
 
             lco_return;
         }
@@ -603,9 +947,17 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
         case OpCodes::Lite::Leave: {
             ZoneScopedN("HandleOperationRequest_Leave");
 
-            // Call into plugins
+            // Call into plugins using a freshly resolved node; its address is
+            // never used by handler code after the await.
             GAME_PLUGINS_INVOKE({
-                OnLeaveGameCallInfo info{.leaver = game_peer_};
+                GamePeer *leaver = nullptr;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    leaver = game->find_peer(peer_);
+                }
+                if (!leaver)
+                    lco_return;
+                OnLeaveGameCallInfo info{.leaver = leaver};
                 const Result res = lco_await game->execute_plugin_chain(&PluginBase::OnLeave, req, info);
 
                 if (res == Result::Fail) {
@@ -654,10 +1006,21 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 lco_return;
             }
 
+            const int32_t sender_actor_id = game->actor_id_for_peer(peer_).value_or(0);
+            if (sender_actor_id == 0)
+                lco_return;
+
             // Call into plugins
             GAME_PLUGINS_INVOKE({
+                GamePeer *setter = nullptr;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    setter = game->find_peer(peer_);
+                }
+                if (!setter)
+                    lco_return;
                 BeforeSetPropertiesCallInfo info{
-                    .setter = game_peer_, .broadcast = broadcast, .target_actor_id = actor_id, .update = props, .expected = props_expected};
+                    .setter = setter, .broadcast = broadcast, .target_actor_id = actor_id, .update = props, .expected = props_expected};
                 const Result res = lco_await game->execute_plugin_chain(&PluginBase::BeforeSetProperties, req, info);
 
                 if (res == Result::Fail) {
@@ -674,17 +1037,11 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             // Set actor or game properties
             bool ok = true;
             if (actor_id) {
-                if (!game->find_peer(actor_id))
-                    ok = false;
-                if (ok && props_expected)
-                    ok = game->expect_actor_props(actor_id, *props_expected);
-                if (ok)
-                    ok = game->insert_actor_props(actor_id, *props);
+                ok = game->apply_actor_props(actor_id, *props,
+                                             props_expected ? std::optional<ser::Hashtable>{*props_expected} : std::nullopt);
             } else {
-                if (props_expected)
-                    ok = game->expect_game_props(*props_expected);
-                if (ok)
-                    game->insert_game_props(*props);
+                ok = game->apply_game_props(*props,
+                                            props_expected ? std::optional<ser::Hashtable>{*props_expected} : std::nullopt);
             }
 
             // Empty response
@@ -696,14 +1053,21 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
             // Broadcast property updates - CRITICAL FIX: MUST broadcast immediately after property update
             // to ensure atomicity: all clients receive property update event before other events
             if (ok && broadcast) {
-                auto event = game->create_property_update_event(game_peer_->actor_id, *props, actor_id);
+                auto event = game->create_property_update_event(sender_actor_id, *props, actor_id);
                 game->broadcast_event(event);
             }
 
             // Call into plugins
             GAME_PLUGINS_INVOKE({
+                GamePeer *setter = nullptr;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    setter = game->find_peer(sender_actor_id);
+                }
+                if (!setter)
+                    lco_return;
                 OnSetPropertiesCallInfo info{
-                    .setter = game_peer_, .broadcast = broadcast, .target_actor_id = actor_id, .update = props, .expected = props_expected};
+                    .setter = setter, .broadcast = broadcast, .target_actor_id = actor_id, .update = props, .expected = props_expected};
                 const Result res = lco_await game->execute_plugin_chain(&PluginBase::OnSetProperties, req, info);
 
                 if (res == Result::Fail)
@@ -725,22 +1089,16 @@ Awaitable<> GameServerHandler::HandleOperationRequest(ser::OperationRequestMessa
                 lco_return;
             }
 
-            if (const auto *removes = params->get<DictKeyCodes::RoutingAndEvents::Remove>()) {
-                if (removes->empty()) {
-                    game_peer_->interest_groups.reset();
-                } else {
-                    for (const uint8_t group : *removes)
-                        game_peer_->interest_groups.reset(group);
-                }
-            }
-            if (const auto *adds = params->get<DictKeyCodes::RoutingAndEvents::Add>()) {
-                if (adds->empty()) {
-                    game_peer_->interest_groups.set();
-                } else {
-                    for (const uint8_t group : *adds)
-                        game_peer_->interest_groups.set(group);
-                }
-            }
+            const std::vector<uint8_t> adds = params->get<DictKeyCodes::RoutingAndEvents::Add>()
+                                                  ? std::vector<uint8_t>(params->get<DictKeyCodes::RoutingAndEvents::Add>()->begin(),
+                                                                         params->get<DictKeyCodes::RoutingAndEvents::Add>()->end())
+                                                  : std::vector<uint8_t>{};
+            const std::vector<uint8_t> removes = params->get<DictKeyCodes::RoutingAndEvents::Remove>()
+                                                     ? std::vector<uint8_t>(params->get<DictKeyCodes::RoutingAndEvents::Remove>()->begin(),
+                                                                            params->get<DictKeyCodes::RoutingAndEvents::Remove>()->end())
+                                                     : std::vector<uint8_t>{};
+            if (!game->apply_interest_groups(peer_, adds, removes))
+                lco_return;
 
             lco_return;
         }

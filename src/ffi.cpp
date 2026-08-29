@@ -864,7 +864,9 @@ void destroyGamePeerContainer(GamePeerHandle game_peer) {
 bool gamePeerIsValid(GamePeerHandle game_peer) {
     return ffi_safe_call<bool>(false, [=] {
         auto *gp = unwrap<server::GamePeer>(game_peer);
-        return gp ? gp->is_valid() : false;
+        // A peer handle is only meaningful while its node is still active in
+        // its owning room; retired nodes must read as invalid.
+        return gp ? gp->is_valid() && !gp->owner_game.expired() : false;
     });
 }
 
@@ -878,15 +880,15 @@ int32_t gamePeerGetActorId(GamePeerHandle game_peer) {
 bool gamePeerHasInterestGroup(GamePeerHandle game_peer, uint8_t group) {
     return ffi_safe_call<bool>(false, [=] {
         auto *gp = unwrap<server::GamePeer>(game_peer);
-        return gp ? gp->interest_groups.test(group) : false;
+        return gp && gamePeerIsValid(game_peer) ? gp->interest_groups.test(group) : false;
     });
 }
 
 void gamePeerSetInterestGroup(GamePeerHandle game_peer, uint8_t group, bool enable) {
     ffi_safe_exec([=] {
-        if (auto *gp = unwrap<server::GamePeer>(game_peer)) {
+        auto *gp = unwrap<server::GamePeer>(game_peer);
+        if (gp && gamePeerIsValid(game_peer))
             gp->interest_groups.set(group, enable);
-        }
     });
 }
 
@@ -894,7 +896,8 @@ void gamePeerGetInterestGroupsMask(GamePeerHandle game_peer, uint32_t *out_mask_
     if (!out_mask_words || max_words == 0)
         return;
     ffi_safe_exec([=] {
-        if (auto *gp = unwrap<server::GamePeer>(game_peer)) {
+        auto *gp = unwrap<server::GamePeer>(game_peer);
+        if (gp && gamePeerIsValid(game_peer)) {
             ffi_size_t limit = std::min<ffi_size_t>(max_words, 8);
             for (ffi_size_t w = 0; w < limit; ++w) {
                 uint32_t word = 0;
@@ -914,7 +917,8 @@ void gamePeerSetInterestGroupsMask(GamePeerHandle game_peer, const uint32_t *mas
     if (!mask_words || word_count == 0)
         return;
     ffi_safe_exec([=] {
-        if (auto *gp = unwrap<server::GamePeer>(game_peer)) {
+        auto *gp = unwrap<server::GamePeer>(game_peer);
+        if (gp && gamePeerIsValid(game_peer)) {
             gp->interest_groups.reset();
             ffi_size_t limit = std::min<ffi_size_t>(word_count, 8);
             for (ffi_size_t w = 0; w < limit; ++w) {
@@ -932,9 +936,9 @@ void gamePeerGetActorProps(GamePeerHandle game_peer, SerValueHandle out_props) {
     if (!out_props)
         return;
     ffi_safe_exec([=] {
-        if (auto *gp = unwrap<server::GamePeer>(game_peer)) {
+        auto *gp = unwrap<server::GamePeer>(game_peer);
+        if (gp && gamePeerIsValid(game_peer))
             *unwrap<luxon::ser::Value>(out_props) = gp->actor_props;
-        }
     });
 }
 
@@ -942,12 +946,12 @@ void gamePeerSetActorProps(GamePeerHandle game_peer, SerValueHandle props) {
     if (!props)
         return;
     ffi_safe_exec([=] {
-        if (auto *gp = unwrap<server::GamePeer>(game_peer)) {
+        auto *gp = unwrap<server::GamePeer>(game_peer);
+        if (gp && gamePeerIsValid(game_peer)) {
             auto *v = unwrap<luxon::ser::Value>(props);
             if (v->is<luxon::ser::HashtablePtr>()) {
-                if (auto ptr = v->get<luxon::ser::HashtablePtr>()) {
+                if (auto ptr = v->get<luxon::ser::HashtablePtr>())
                     gp->actor_props = *ptr;
-                }
             }
         }
     });
@@ -956,8 +960,9 @@ void gamePeerSetActorProps(GamePeerHandle game_peer, SerValueHandle props) {
 PeerHandle gamePeerGetBasePeer(GamePeerHandle game_peer) {
     return ffi_safe_call<PeerHandle>(wrap<PeerHandle>(nullptr), [=] {
         if (auto *gp = unwrap<server::GamePeer>(game_peer)) {
-            if (auto sp = gp->peer.lock())
-                return wrap<PeerHandle>(sp.get());
+            if (gamePeerIsValid(game_peer))
+                if (auto sp = gp->peer.lock())
+                    return wrap<PeerHandle>(sp.get());
         }
         return wrap<PeerHandle>(nullptr);
     });
@@ -966,7 +971,7 @@ PeerHandle gamePeerGetBasePeer(GamePeerHandle game_peer) {
 bool gamePeerDisconnect(GamePeerHandle game_peer) {
     return ffi_safe_call<bool>(false, [=] {
         auto *gp = unwrap<server::GamePeer>(game_peer);
-        return gp ? gp->disconnect() : false;
+        return gp && gamePeerIsValid(game_peer) ? gp->disconnect() : false;
     });
 }
 
@@ -1152,76 +1157,79 @@ void gameGetConfigState(GameHandle game, uint8_t *out_flags, bool *out_is_create
                         int32_t *out_master_actor) {
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game)) {
+            const auto state = g->get_config_snapshot();
             if (out_flags)
-                *out_flags = g->flags;
+                *out_flags = state.flags;
             if (out_is_created)
-                *out_is_created = g->is_created;
+                *out_is_created = state.is_created;
             if (out_is_open)
-                *out_is_open = g->is_open;
+                *out_is_open = state.is_open;
             if (out_is_visible)
-                *out_is_visible = g->is_visible;
+                *out_is_visible = state.is_visible;
             if (out_max_peers)
-                *out_max_peers = g->max_peers;
+                *out_max_peers = state.max_peers;
             if (out_master_actor)
-                *out_master_actor = g->master_actor;
+                *out_master_actor = state.master_actor;
         }
     });
 }
 
 void gameSetConfigState(GameHandle game, uint8_t flags, bool is_open, bool is_visible, uint8_t max_peers, int32_t master_actor) {
     ffi_safe_exec([=] {
-        if (auto *g = unwrap<server::Game>(game)) {
-            g->flags = flags;
-            g->is_open = is_open;
-            g->is_visible = is_visible;
-            g->max_peers = max_peers;
-            g->master_actor = master_actor;
-        }
+        if (auto *g = unwrap<server::Game>(game))
+            g->set_config_state(flags, is_open, is_visible, max_peers, master_actor);
     });
 }
 
 int32_t gameGetMasterActor(GameHandle game) {
     return ffi_safe_call<int32_t>(0, [=] {
         auto *g = unwrap<server::Game>(game);
-        return g ? g->master_actor : 0;
+        return g ? g->get_config_snapshot().master_actor : 0;
     });
 }
 
 void gameSetMasterActor(GameHandle game, int32_t actor_id) {
     ffi_safe_exec([=] {
-        if (auto *g = unwrap<server::Game>(game))
-            g->master_actor = actor_id;
+        if (auto *g = unwrap<server::Game>(game)) {
+            const auto state = g->get_config_snapshot();
+            g->set_config_state(state.flags, state.is_open, state.is_visible,
+                                state.max_peers, actor_id);
+        }
     });
 }
 
 int32_t gameGetLastActorId(GameHandle game) {
     return ffi_safe_call<int32_t>(0, [=] {
         auto *g = unwrap<server::Game>(game);
-        return g ? g->last_actor_id : 0;
+        return g ? g->get_config_snapshot().last_actor_id : 0;
     });
 }
 
 uint8_t gameGetMaxPeers(GameHandle game) {
     return ffi_safe_call<uint8_t>(0, [=] {
         auto *g = unwrap<server::Game>(game);
-        return g ? g->max_peers : 0;
+        return g ? g->get_config_snapshot().max_peers : 0;
     });
 }
 
 void gameSetMaxPeers(GameHandle game, uint8_t max_peers) {
     ffi_safe_exec([=] {
-        if (auto *g = unwrap<server::Game>(game))
-            g->max_peers = max_peers;
+        if (auto *g = unwrap<server::Game>(game)) {
+            const auto state = g->get_config_snapshot();
+            g->set_config_state(state.flags, state.is_open, state.is_visible,
+                                max_peers, state.master_actor);
+        }
     });
 }
 
 void gameGetTtlConfig(GameHandle game, int32_t *out_player_ttl, int32_t *out_empty_ttl) {
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game)) {
+            const auto state = g->get_config_snapshot();
             if (out_player_ttl)
-                *out_player_ttl = g->player_ttl;
+                *out_player_ttl = state.player_ttl;
             if (out_empty_ttl)
-                *out_empty_ttl = g->empty_game_ttl;
+                *out_empty_ttl = state.empty_game_ttl;
         }
     });
 }
@@ -1229,8 +1237,10 @@ void gameGetTtlConfig(GameHandle game, int32_t *out_player_ttl, int32_t *out_emp
 void gameSetTtlConfig(GameHandle game, int32_t player_ttl, int32_t empty_ttl) {
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game)) {
+            std::lock_guard admission_lock(g->admission_mutex);
             g->player_ttl = player_ttl;
             g->empty_game_ttl = empty_ttl;
+            ++g->state_revision_;
         }
     });
 }
@@ -1240,6 +1250,7 @@ void gameGetCustomProps(GameHandle game, SerValueHandle out_custom_props) {
         return;
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game)) {
+            std::lock_guard admission_lock(g->admission_mutex);
             *unwrap<luxon::ser::Value>(out_custom_props) = g->custom_props;
         }
     });
@@ -1253,6 +1264,7 @@ void gameSetCustomProps(GameHandle game, SerValueHandle custom_props) {
             auto *v = unwrap<luxon::ser::Value>(custom_props);
             if (v->is<luxon::ser::HashtablePtr>()) {
                 if (auto ptr = v->get<luxon::ser::HashtablePtr>()) {
+                    std::lock_guard admission_lock(g->admission_mutex);
                     g->custom_props = *ptr;
                 }
             }
@@ -1265,6 +1277,7 @@ void gameGetLobbyPropsToSerValue(GameHandle game, SerValueHandle out_keys_array)
         return;
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game)) {
+            std::lock_guard admission_lock(g->admission_mutex);
             *unwrap<luxon::ser::Value>(out_keys_array) = g->lobby_props;
         }
     });
@@ -1277,6 +1290,7 @@ void gameSetLobbyPropsFromSerValue(GameHandle game, SerValueHandle keys_array) {
         if (auto *g = unwrap<server::Game>(game)) {
             auto *v = unwrap<luxon::ser::Value>(keys_array);
             if (v->is<std::vector<std::string>>()) {
+                std::lock_guard admission_lock(g->admission_mutex);
                 g->lobby_props = v->get<std::vector<std::string>>();
             }
         }
@@ -1288,6 +1302,7 @@ void gameGetExpectedUsersToSerValue(GameHandle game, SerValueHandle out_list) {
         return;
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game)) {
+            std::lock_guard admission_lock(g->admission_mutex);
             std::vector<std::string> vec(g->expected_users.begin(), g->expected_users.end());
             *unwrap<luxon::ser::Value>(out_list) = vec;
         }
@@ -1302,7 +1317,15 @@ void gameSetExpectedUsersFromSerValue(GameHandle game, SerValueHandle list) {
             auto *v = unwrap<luxon::ser::Value>(list);
             if (v->is<std::vector<std::string>>()) {
                 const auto& vec = v->get<std::vector<std::string>>();
-                g->expected_users = std::unordered_set<std::string>(vec.begin(), vec.end());
+                std::lock_guard admission_lock(g->admission_mutex);
+                std::vector<std::string> previous_expected_users(
+                    g->expected_users.begin(),
+                    g->expected_users.end());
+                for (const auto& expected_user : previous_expected_users)
+                    g->remove_expected_user(expected_user);
+                for (const auto& expected_user : vec)
+                    if (!expected_user.empty())
+                        g->reserve_expected_user(expected_user);
             }
         }
     });
@@ -1313,7 +1336,7 @@ void gameAddExpectedUser(GameHandle game, const char *user_id) {
         return;
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game))
-            g->expected_users.insert(user_id);
+            g->reserve_expected_user(user_id);
     });
 }
 
@@ -1322,14 +1345,14 @@ void gameRemoveExpectedUser(GameHandle game, const char *user_id) {
         return;
     ffi_safe_exec([=] {
         if (auto *g = unwrap<server::Game>(game))
-            g->expected_users.erase(user_id);
+            g->remove_expected_user(user_id);
     });
 }
 
 ffi_size_t gameGetPeerCount(GameHandle game) {
     return ffi_safe_call<ffi_size_t>(0, [=] {
         auto *g = unwrap<server::Game>(game);
-        return g ? static_cast<ffi_size_t>(g->peers.size()) : 0;
+        return g ? static_cast<ffi_size_t>(g->active_peer_count()) : 0;
     });
 }
 
@@ -1352,7 +1375,11 @@ GamePeerHandle gameAddPeer(GameHandle game, GamePeerHandle game_peer) {
         if (!g || !gp_heap)
             return wrap<GamePeerHandle>(nullptr);
 
-        server::GamePeer *persistent_slot = g->add_peer(std::move(*gp_heap));
+        server::GamePeer *persistent_slot = nullptr;
+        {
+            std::lock_guard admission_lock(g->admission_mutex);
+            persistent_slot = g->add_peer(std::move(*gp_heap));
+        }
         delete gp_heap;
         return wrap<GamePeerHandle>(persistent_slot);
     });
@@ -1374,14 +1401,22 @@ bool gameFloodPeer(GameHandle game, GamePeerHandle game_peer) {
     return ffi_safe_call<bool>(false, [=] {
         auto *g = unwrap<server::Game>(game);
         auto *gp = unwrap<server::GamePeer>(game_peer);
-        return (g && gp) ? g->flood_peer(gp) : false;
+        if (!g || !gp)
+            return false;
+        // Resolve through the actor id so a retired node handle cannot be
+        // flooded after it has left the active peer list.
+        std::lock_guard admission_lock(g->admission_mutex);
+        return g->flood_peer_by_actor(gp->actor_id);
     });
 }
 
 GamePeerHandle gameFindPeerByActorId(GameHandle game, int32_t actor_id) {
     return ffi_safe_call<GamePeerHandle>(wrap<GamePeerHandle>(nullptr), [=] {
         auto *g = unwrap<server::Game>(game);
-        return g ? wrap<GamePeerHandle>(g->find_peer(actor_id)) : wrap<GamePeerHandle>(nullptr);
+        if (!g)
+            return wrap<GamePeerHandle>(nullptr);
+        std::lock_guard admission_lock(g->admission_mutex);
+        return wrap<GamePeerHandle>(g->find_peer(actor_id));
     });
 }
 
@@ -1393,6 +1428,7 @@ GamePeerHandle gameFindPeerByBasePeer(GameHandle game, PeerHandle peer) {
             return wrap<GamePeerHandle>(nullptr);
 
         std::shared_ptr<server::Peer> sp(p, [](server::Peer *) {});
+        std::lock_guard admission_lock(g->admission_mutex);
         return wrap<GamePeerHandle>(g->find_peer(sp));
     });
 }

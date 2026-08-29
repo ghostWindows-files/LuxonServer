@@ -14,11 +14,13 @@
 
 #include <memory>
 #include <atomic>
+#include <mutex>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
 #include <list>
 #include <variant>
+#include <optional>
 #include <bitset>
 #include <array>
 #include <utility>
@@ -44,6 +46,7 @@ namespace server {
 class App;
 struct Lobby;
 struct Peer;
+struct Game;
 
 struct GameInfo {
     LobbyInfo lobby;
@@ -79,11 +82,14 @@ struct InterestGroups {
 
 struct GamePeer {
     std::weak_ptr<Peer> peer;
+    // Owning room used by FFI handles to detect retired/stale nodes.
+    std::weak_ptr<Game> owner_game;
     int32_t actor_id{};
     ser::Hashtable actor_props;
     InterestGroups interest_groups;
+    bool active = true;
 
-    bool is_valid() const { return actor_id > 0; }
+    bool is_valid() const { return active && actor_id > 0; }
     bool disconnect();
 };
 
@@ -98,6 +104,13 @@ struct Event {
     ser::Dictionary top_params;
 
     mutable std::array<ser::ByteArray, static_cast<size_t>(ser::ProtocolImplID::__length)> cached_data;
+    // Event packets can be serialized concurrently for several recipients.
+    mutable std::shared_ptr<std::mutex> cache_mutex = std::make_shared<std::mutex>();
+
+    Event(const Event&) = default;
+    Event& operator=(const Event&) = default;
+    Event(Event&&) noexcept = default;
+    Event& operator=(Event&&) noexcept = default;
     std::expected<ser::ByteArray, ser::Error> get_cached_data(ser::IProtocol& protocol) const;
 
     ser::Hashtable& make_params_hashtable() { return *(data = std::make_shared<ser::Hashtable>()).get<ser::HashtablePtr>(); }
@@ -120,7 +133,7 @@ struct Game : std::enable_shared_from_this<Game> {
 #endif
 
     uint8_t flags = 3; // CheckUserOnJoin | DeleteCacheOnLeave
-    bool is_created = false;
+    std::atomic_bool is_created = false;
     bool is_open = true;
     bool is_visible = true;
     int32_t player_ttl = 0;
@@ -129,19 +142,13 @@ struct Game : std::enable_shared_from_this<Game> {
     int32_t master_actor = 1;
     int32_t last_actor_id = 0;
     std::unordered_set<std::string> expected_users;
+    std::unordered_map<std::string, uint64_t> expected_user_generations;
+    uint64_t next_expected_user_generation = 0;
     ser::Hashtable custom_props;
     std::vector<std::string> lobby_props;
     std::list<Event> event_cache;
     
-    // True while the first join request is initializing the room. Pending requests
-    // remain on their own handlers so they can resume with the original context.
-    std::atomic_bool is_creating = false;
-
-    bool try_begin_creation();
-    void finish_creation() { is_creating.store(false, std::memory_order_release); }
-
-
-    // Player state tracking for reconnection support (Phase 4)
+    // Player state tracking for reconnection support.
     struct InactivePlayerInfo {
         int32_t actor_id;
         std::string user_id;
@@ -151,9 +158,87 @@ struct Game : std::enable_shared_from_this<Game> {
     };
     std::unordered_map<std::string, InactivePlayerInfo> inactive_players;
 
+    // Snapshots used to roll back a failed first-join transaction.
+    bool creation_initial_is_created_{};
+    int32_t creation_initial_last_actor_id_{};
+    uint8_t creation_initial_dummy_peer_count_{};
+    std::list<Event> creation_initial_event_cache_;
+    std::unordered_set<std::string> creation_initial_expected_users_;
+    std::unordered_map<std::string, uint64_t> creation_initial_expected_user_generations_;
+    std::unordered_map<std::string, InactivePlayerInfo> creation_initial_inactive_players_;
+    std::unordered_map<std::string, uint64_t> creation_reserved_expected_user_generations_;
+    std::unordered_map<std::string, uint64_t> creation_removed_expected_user_generations_;
+
+    // True while the first join request is initializing the room. Pending requests
+    // remain on their own handlers so they can resume with the original context.
+    std::atomic_bool is_creating = false;
+    mutable std::mutex creation_state_mutex_;
+    std::weak_ptr<Peer> creation_owner_;
+    uint64_t next_creation_generation_{};
+    uint64_t active_creation_generation_{};
+    uint64_t state_revision_{};
+    uint8_t creation_initial_flags_{};
+    bool creation_initial_is_open_{};
+    bool creation_initial_is_visible_{};
+    int32_t creation_initial_player_ttl_{};
+    int32_t creation_initial_empty_game_ttl_{};
+    uint8_t creation_initial_max_peers_{};
+    int32_t creation_initial_master_actor_{};
+    ser::Hashtable creation_initial_custom_props_;
+    std::vector<std::string> creation_initial_lobby_props_;
+#ifdef LUXON_SERVER_ENABLE_PLUGINS
+    size_t creation_initial_plugin_count_{};
+#endif
+
+    // Serializes the admission/actor-allocation portion of joins. Plugin hooks may
+    // suspend outside this lock, but the final capacity check and insertion are
+    // performed while holding it.
+    mutable std::recursive_mutex admission_mutex;
+
+    uint64_t try_begin_creation(const std::shared_ptr<Peer>& owner);
+    bool is_creation_active(const std::shared_ptr<Peer>& owner,
+                            uint64_t generation) const;
+    bool commit_creation(const std::shared_ptr<Peer>& owner,
+                         uint64_t generation);
+    bool abort_creation_transaction(const std::shared_ptr<Peer>& owner,
+                                    uint64_t generation);
+
+    uint64_t active_creation_generation() const;
+    bool is_joinable() const;
+    std::optional<int32_t> actor_id_for_peer(const std::shared_ptr<Peer>& peer) const;
+    bool has_peer_actor(int32_t actor_id) const;
+    /// Monotonic counter bumped by every externally visible state transition.
+    /// Callers must hold admission_mutex while writing state_revision_ directly.
+    uint64_t state_revision() const;
+
+    struct ConfigSnapshot {
+        uint8_t flags{};
+        bool is_created{};
+        bool is_open{};
+        bool is_visible{};
+        uint8_t max_peers{};
+        int32_t master_actor{};
+        int32_t player_ttl{};
+        int32_t empty_game_ttl{};
+        int32_t last_actor_id{};
+        uint8_t dummy_peer_count{};
+        size_t peer_count{};
+    };
+
+    ConfigSnapshot get_config_snapshot() const;
+    size_t active_peer_count() const;
+    void set_config_state(uint8_t new_flags, bool new_is_open,
+                          bool new_is_visible, uint8_t new_max_peers,
+                          int32_t new_master_actor);
+    bool has_expected_user(std::string_view user_id) const;
+
+
     Game(std::shared_ptr<Lobby> lobby, std::string id, std::string_view server_address);
 
     std::list<GamePeer> peers;
+    // Removed nodes are retired instead of erased so plugin call-info pointers
+    // remain address-stable until the Game itself is destroyed.
+    std::list<GamePeer> retired_peers;
     uint8_t dummy_peer_count = 0;
 
     ///
@@ -189,6 +274,8 @@ struct Game : std::enable_shared_from_this<Game> {
     /// \note Returned GamePeer has actor_id set, but actor_id won't be fully reserved. It might be taken by another GamePeer after a long time.
     ///
     GamePeer create_peer(std::shared_ptr<Peer> peer);
+    /// Creates a GamePeer with a specific actor id (used for rejoin flows).
+    GamePeer create_peer_for_actor(std::shared_ptr<Peer> peer, int32_t actor_id);
     ///
     /// \brief Adds given GamePeer to game
     /// \param game_peer GamePeer to add to game, must've been previously been created by the same Game using create_peer()
@@ -196,6 +283,26 @@ struct Game : std::enable_shared_from_this<Game> {
     /// \note Fails if actor_id is already taken or CheckUserOnJoin flag is set and user id is already taken
     ///
     GamePeer *add_peer(GamePeer&& game_peer);
+    GamePeer *add_peer_for_creation(GamePeer&& game_peer,
+                                    const std::shared_ptr<Peer>& owner,
+                                    uint64_t generation);
+    ///
+    /// \brief Adds a temporary expected user reservation with generation-safe expiry.
+    /// \return True when a new reservation was added.
+    ///
+    std::optional<uint64_t> reserve_expected_user_with_generation(std::string user_id,
+                                                                  unsigned ttl_ms = 30000);
+    bool reserve_expected_user(std::string user_id, unsigned ttl_ms = 30000);
+    ///
+    /// \brief Removes an expected user reservation and invalidates its expiry callback.
+    ///
+    void remove_expected_user(std::string_view user_id);
+    bool remove_expected_user_if_generation(std::string_view user_id,
+                                            uint64_t generation);
+    /// Applies additive/removal interest-group changes to the caller's actor.
+    bool apply_interest_groups(const std::shared_ptr<Peer>& peer,
+                               const std::vector<uint8_t>& add,
+                               const std::vector<uint8_t>& remove);
     ///
     /// \brief Removes peer's GamePeer from game
     /// \param peer Peer whos GamePeer to remove
@@ -208,17 +315,20 @@ struct Game : std::enable_shared_from_this<Game> {
     /// \return True if flooding was successful, otherwise false
     ///
     bool flood_peer(GamePeer *game_peer);
+    bool flood_peer_by_actor(int32_t actor_id);
     ///
     /// \brief Finds game peer with given actor_id
     /// \param actor_id Actor_id to look for
     /// \return Pointer to GamePeer with given actor_id if successful, otherwise nullptr
     ///
+    // The returned pointer is valid only while admission_mutex is held by the caller.
     GamePeer *find_peer(int32_t actor_id);
     ///
     /// \brief Finds game peer with given peer
     /// \param peer Peer to look for
     /// \return Pointer to GamePeer with given actor_id if successful, otherwise nullptr
     ///
+    // The returned pointer is valid only while admission_mutex is held by the caller.
     GamePeer *find_peer(const std::shared_ptr<Peer>& peer);
     ///
     /// \brief Broadcasts an event to the game
@@ -231,7 +341,12 @@ struct Game : std::enable_shared_from_this<Game> {
     /// \param new_expected_users_count Amount of users to calculate in as well
     /// \return ErrorCode value and error string
     ///
-    std::pair<int16_t, std::string_view> validate_join(const std::string& user_id, size_t new_expected_users_count = 0) const;
+    std::pair<int16_t, std::string_view> validate_join(const std::string& user_id,
+                                                       size_t new_expected_users_count = 0,
+                                                       bool allow_uncreated = false) const;
+    std::pair<int16_t, std::string_view> validate_join(const std::string& user_id,
+                                                       const std::vector<std::string>& new_expected_users,
+                                                       bool allow_uncreated = false) const;
 
     ///
     /// \brief Updates the game in the lobby's game list
@@ -260,6 +375,8 @@ struct Game : std::enable_shared_from_this<Game> {
     /// \return Hashtable with actor->properties pairs containing key/value property pairs
     ///
     ser::Hashtable get_actor_props();
+    /// Consistent snapshot of an actor's properties for external consumers.
+    ser::Hashtable get_actor_props_for(int32_t actor_id);
     ///
     /// \brief Merges a hashtable with given properties into game properties
     /// \param update Hashtable with keys/value property pairs
@@ -278,6 +395,11 @@ struct Game : std::enable_shared_from_this<Game> {
     /// \return True if given actor was found and its properties updated
     ///
     bool insert_actor_props(int32_t actor_id, const ser::Hashtable& update);
+    /// Atomically validates expected properties and applies the update.
+    bool apply_game_props(const ser::Hashtable& update,
+                          const std::optional<ser::Hashtable>& expected);
+    bool apply_actor_props(int32_t actor_id, const ser::Hashtable& update,
+                           const std::optional<ser::Hashtable>& expected);
     ///
     /// \brief Checks if the expectation of given properties is met
     /// \param actor_id actor_id of actor whos properties to access

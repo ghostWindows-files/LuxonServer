@@ -19,6 +19,7 @@ class EnetCommandHeader;
 namespace server {
 class HandlerBase;
 class MasterServerHandler;
+class App;
 struct AppSettings;
 
 struct Hookpoints {

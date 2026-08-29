@@ -145,7 +145,7 @@ size_t Lobby::get_peer_count() const {
     size_t fres = 0;
     for (auto& weak_game : games)
         if (auto game = weak_game.lock())
-            fres += game->peers.size();
+            fres += game->active_peer_count();
     return fres;
 }
 
@@ -155,7 +155,7 @@ size_t Lobby::get_master_peer_count() const {
     size_t fres = 0;
     for (auto& weak_game : games)
         if (auto game = weak_game.lock())
-            fres += !!game->find_peer(game->master_actor);
+            fres += game->has_peer_actor(game->get_config_snapshot().master_actor);
     return fres;
 }
 

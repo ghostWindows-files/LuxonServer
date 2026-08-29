@@ -58,6 +58,20 @@ protected:
 
     std::optional<JoinedLobby> joined_lobby_;
     common::Timer last_batched_update_;
+    struct PendingJoin {
+        std::shared_ptr<Game> game;
+        uint64_t creation_generation{};
+        ser::OperationRequestMessage request;
+        bool is_encrypted{};
+        enet::EnetCommandHeader command_header;
+        common::Timer wait_started;
+    };
+    std::optional<PendingJoin> pending_join_;
+
+    // Reservations created by the in-flight request that have not been
+    // handed off to a routed response yet. Cleaned up on disconnect so a
+    // crashed matchmaking request cannot block capacity for the full TTL.
+    std::vector<std::pair<std::weak_ptr<Game>, std::pair<std::string, uint64_t>>> owned_reservations_;
 
     std::vector<GameListUpdate> pending_game_list_updates_;
 
@@ -69,6 +83,8 @@ protected:
     void send_app_stats();
     ser::Dictionary get_lobby_stats(std::function<bool(const Lobby&)> lobby_filter = nullptr);
     void send_lobby_stats();
+
+    Awaitable<> HandleDisconnect() override;
 
     ser::HashtablePtr get_game_list(Lobby& lobby, const Game& game);
     ser::HashtablePtr get_game_list(Lobby& lobby, std::function<bool(const Game&)> game_filter = nullptr);

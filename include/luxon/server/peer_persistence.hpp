@@ -24,6 +24,8 @@ class PeerPersistent {
 public:
     std::shared_ptr<App> app;
     std::string user_id, token;
+    int32_t reconnect_ttl_ms = 30000;
+    uint64_t store_generation{};
 
     void reset_invitation() {
         invitation = {};
@@ -41,7 +43,9 @@ public:
         return owned_game.get() == &game;
     }
     void reset_owned_game_if_created() {
-        if (owned_game && owned_game->is_created)
+        if (owned_game &&
+            owned_game->is_created.load(std::memory_order_acquire) &&
+            !owned_game->is_creating.load(std::memory_order_acquire))
             owned_game.reset();
     }
 

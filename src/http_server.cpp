@@ -21,6 +21,7 @@
 #include <format>
 #include <charconv>
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <fcntl.h>
 #include <luxon/http_parser.hpp>
@@ -770,19 +771,30 @@ json HttpServer::route_request(std::string_view method, std::string path) {
                 throw std::out_of_range("Game expired");
 
             // /apps/{app}/games/{game_id}
-            if (segs.size() == 4)
+            if (segs.size() == 4) {
+                const auto state = game->get_config_snapshot();
+                std::vector<std::string> expected_users;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    expected_users.assign(game->expected_users.begin(), game->expected_users.end());
+                }
                 return {{"id", game->id},
-                        {"master_client_id", game->master_actor},
-                        {"player_ttl", game->player_ttl},
-                        {"empty_room_ttl", game->empty_game_ttl},
-                        {"flags", game->flags},
-                        {"expected_users", game->expected_users},
+                        {"master_client_id", state.master_actor},
+                        {"player_ttl", state.player_ttl},
+                        {"empty_room_ttl", state.empty_game_ttl},
+                        {"flags", state.flags},
+                        {"expected_users", expected_users},
                         {"full_props", json_conv::photon_hash_to_json(game->get_game_props())}};
+            }
 
             // /apps/{app}/games/{game_id}/actors
             if (segs.size() == 5 && segs[4] == "actors") {
                 json res = json::array();
+                const ser::Hashtable all_actor_props = game->get_actor_props();
+                std::lock_guard admission_lock(game->admission_mutex);
                 for (auto& gp : game->peers) {
+                    if (!gp.active)
+                        continue;
                     std::string uid = "";
                     // If persistent peer is still attached (could be disconnected/stale)
                     if (auto p = gp.peer.lock())
@@ -806,18 +818,26 @@ json HttpServer::route_request(std::string_view method, std::string path) {
                 int actorId = 0;
                 std::from_chars(segs[5].data(), segs[5].data() + segs[5].size(), actorId);
 
-                const auto *gp = game->find_peer(actorId);
-                if (!gp)
+                const auto actor_props = game->get_actor_props_for(actorId);
+                std::optional<std::pair<std::shared_ptr<Peer>, InterestGroups>> connection;
+                {
+                    std::lock_guard admission_lock(game->admission_mutex);
+                    if (const auto *gp = game->find_peer(actorId)) {
+                        if (auto p = gp->peer.lock())
+                            connection.emplace(std::move(p), gp->interest_groups);
+                    }
+                }
+                if (!connection)
                     throw std::out_of_range("Actor ID not found");
 
-                json res = {{"actor_id", gp->actor_id},
-                            {"props", json_conv::photon_hash_to_json(gp->actor_props)},
-                            {"interest_groups", gp->interest_groups.to_string()}};
+                auto& [peer, interest_groups] = *connection;
+                json res = {{"actor_id", actorId},
+                            {"props", json_conv::photon_hash_to_json(actor_props)},
+                            {"interest_groups", interest_groups.to_string()}};
 
-                if (auto p = gp->peer.lock())
-                    if (p->is_authenticated())
-                        res["connection_info"] = {
-                            {"peer_id", p->enet_peer->peer_id()}, {"rtt", p->enet_peer->round_trip_time()}, {"user_id", p->persistent->user_id}};
+                if (peer->is_authenticated())
+                    res["connection_info"] = {
+                        {"peer_id", peer->enet_peer->peer_id()}, {"rtt", peer->enet_peer->round_trip_time()}, {"user_id", peer->persistent->user_id}};
                 return res;
             }
         }
@@ -846,11 +866,12 @@ json HttpServer::route_request(std::string_view method, std::string path) {
                 json res = json::array();
                 for (auto& weak_g : lobby->games) {
                     if (auto g = weak_g.lock()) {
+                        const auto state = g->get_config_snapshot();
                         res.push_back({{"id", g->id},
-                                       {"player_count", g->peers.size()},
-                                       {"max_players", g->max_peers},
-                                       {"is_open", g->is_open},
-                                       {"is_visible", g->is_visible},
+                                       {"player_count", state.peer_count},
+                                       {"max_players", state.max_peers},
+                                       {"is_open", state.is_open},
+                                       {"is_visible", state.is_visible},
                                        {"lobby_props", json_conv::photon_hash_to_json(g->get_lobby_game_props())}});
                     }
                 }

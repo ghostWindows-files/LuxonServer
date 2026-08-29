@@ -45,8 +45,10 @@ std::optional<int> fast_stoi(std::string_view sv, int base = 10) {
 } // namespace
 
 HandlerBase::~HandlerBase() {
-    if (peer_->persistent)
+    if (peer_->persistent) {
+        sync_persistent_peer(server_manager_, *peer_->persistent);
         store_persistent_peer(server_manager_, std::move(peer_->persistent));
+    }
 }
 
 Awaitable<> HandlerBase::HandleConnect() {

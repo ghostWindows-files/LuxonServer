@@ -7,6 +7,7 @@
 
 #include <vector>
 #include <functional>
+#include <unordered_map>
 
 #if defined(__linux__)
 #include <unistd.h>

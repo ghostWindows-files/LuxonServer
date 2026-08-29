@@ -50,7 +50,7 @@ struct Peer;
 struct PeerPersistent;
 class App;
 
-template <typename T> using HandlerPtr = std::unique_ptr<T>;
+template <typename T> using HandlerPtr = std::shared_ptr<T>;
 
 enum class ServerType { None, NameServer, MasterServer, GameServer };
 
@@ -363,6 +363,8 @@ public:
     /// \return Expected containing a shared pointer to the game on success, or an error message string on failure
     ///
     std::expected<std::shared_ptr<Game>, std::string> try_get_game(const GameInfo& info) { return get_game(*try_get_lobby(info.lobby), info); }
+
+    bool has_persistent_peer(std::string_view token) const;
 
     bool is_game_external(Game& game) const {
 #ifdef LUXON_SERVER_ENABLE_MULTIPROCESSING
